@@ -2,14 +2,13 @@
 // src/monitor.js — 核心监控引擎 V4
 //
 // V4 改进：
-//   1. 去掉监控期限制，代币持续监控直到手动移除或达到最大交易次数
+//   1. 去掉监控期限制和最大交易次数限制，代币持续监控直到手动移除
 //   2. K线改为1分钟，止损轮询改为1分钟（可配置 SL_POLL_SEC）
 //   3. 支持手动添加/删除代币
 //   4. 卖出后不退出监控，重置状态等待下一个买入信号
-//   5. MAX_TRADES_PER_TOKEN 限制单个 token 最大交易次数
 //
 // 交易生命周期：
-//   addToken → [BUY → SELL → 冷却 → BUY → SELL → ...] → MAX_TRADES/手动移除 → removeToken
+//   addToken → [BUY → SELL → 冷却 → BUY → SELL → ...] → 手动移除 → removeToken
 
 const EventEmitter = require('events');
 const { evaluateSignal, buildCandles, filterValidCandles, checkStopLoss,
@@ -32,7 +31,6 @@ const POLL_SEC          = parseInt(process.env.PRICE_POLL_SEC        || '1',  10
 const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '60', 10);
 const DRY_RUN           = (process.env.DRY_RUN || 'false') === 'true';
 const TRADE_SOL         = parseFloat(process.env.TRADE_SIZE_SOL      || '0.2');
-const MAX_TRADES        = parseInt(process.env.MAX_TRADES_PER_TOKEN  || '5',  10);
 const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '30', 10);
 const SL_POLL_SEC       = parseInt(process.env.SL_POLL_SEC           || '60', 10);
 
@@ -74,8 +72,8 @@ class TokenMonitor extends EventEmitter {
 
     this._scheduleNextPoll();
     this._startStopLossPoller();  // ★ 500ms 独立止损轮询
-    logger.info('[Monitor] 启动 | 轮询=%ds K线=%ds 止损轮询=%ds 最大交易=%d次 冷却=%ds DRY_RUN=%s',
-      POLL_SEC, KLINE_SEC, SL_POLL_SEC, MAX_TRADES, SELL_COOLDOWN_SEC, DRY_RUN);
+    logger.info('[Monitor] 启动 | 轮询=%ds K线=%ds 止损轮询=%ds 冷却=%ds DRY_RUN=%s',
+      POLL_SEC, KLINE_SEC, SL_POLL_SEC, SELL_COOLDOWN_SEC, DRY_RUN);
     logger.info('[Monitor]   BirdeyeWS=%s  HeliusWS=%s',
       birdeye.priceStream.isConnected() ? '已连接' : '连接中',
       heliusWs.isConnected() ? '已连接' : '连接中');
@@ -143,9 +141,8 @@ class TokenMonitor extends EventEmitter {
       this._onChainTrade(address, trade);
     });
 
-    logger.info('[Monitor] ➕ 开始监控 %s (%s) | 最多%d笔 | DRY_RUN=%s',
-      symbol, address,
-      MAX_TRADES, DRY_RUN);
+    logger.info('[Monitor] ➕ 开始监控 %s (%s) | DRY_RUN=%s',
+      symbol, address, DRY_RUN);
     this._broadcastTokenList();
     return true;
   }
@@ -466,15 +463,7 @@ class TokenMonitor extends EventEmitter {
     // 正在卖出中，跳过此轮
     if (state._selling) return;
 
-    // 1. 最大交易次数检查（非持仓时检查，持仓中让它继续完成当前交易）
-    if (state.tradeCount >= MAX_TRADES && !state.inPosition) {
-      logger.info('[Monitor] %s 已达到最大交易次数 %d/%d，移除',
-        state.symbol, state.tradeCount, MAX_TRADES);
-      await this.removeToken(address, `MAX_TRADES(${state.tradeCount}/${MAX_TRADES})`);
-      return;
-    }
-
-    // 3. 获取价格
+    // 1. 获取价格
     let price;
     try {
       price = await birdeye.getPrice(address);
@@ -539,7 +528,6 @@ class TokenMonitor extends EventEmitter {
       inPosition:  state.inPosition,
       volume,
       tradeCount:  state.tradeCount,
-      maxTrades:   MAX_TRADES,
       cooldown:    state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0,
       dryRun:      DRY_RUN,
       ts:          now,
@@ -548,9 +536,9 @@ class TokenMonitor extends EventEmitter {
       heliusStats: heliusWs.getStats(),
     });
 
-    logger.debug('[RSI] %s price=%.6f rsi=%.2f prev=%.2f signal=%s reason=%s trades=%d/%d inPos=%s cool=%ds',
+    logger.debug('[RSI] %s price=%.6f rsi=%.2f prev=%.2f signal=%s reason=%s trades=%d inPos=%s cool=%ds',
       state.symbol, price, rsi, prevRsi, signal || 'none', reason,
-      state.tradeCount, MAX_TRADES, state.inPosition,
+      state.tradeCount, state.inPosition,
       state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0);
 
     // 10. 执行信号
@@ -575,8 +563,6 @@ class TokenMonitor extends EventEmitter {
     if (state.inPosition) return false;
     // 正在卖出中
     if (state._selling) return false;
-    // 已达最大交易次数
-    if (state.tradeCount >= MAX_TRADES) return false;
     // 冷却期中
     if (now < state._sellCooldownUntil) {
       logger.debug('[Monitor] %s 冷却中，还剩 %ds',
@@ -725,16 +711,8 @@ class TokenMonitor extends EventEmitter {
     state._wsTickPrevRsi  = NaN;    // ★ 重置WS tick RSI历史
     state._slPollPrevRsi  = NaN;    // ★ 重置轮询RSI历史
 
-    const remaining = Math.max(0, MAX_TRADES - state.tradeCount);
-    logger.info('[Monitor] 🔄 %s 第%d笔完成 | 剩余额度=%d笔 | 冷却=%ds',
-      state.symbol, tradeNum, remaining, SELL_COOLDOWN_SEC);
-
-    // 如果已达最大交易次数，立即移除
-    if (state.tradeCount >= MAX_TRADES) {
-      logger.info('[Monitor] 🏁 %s 已达最大交易次数 %d，移除监控', state.symbol, MAX_TRADES);
-      // 延迟一点移除，让广播先发出
-      setTimeout(() => this.removeToken(state.address, `MAX_TRADES(${state.tradeCount})`), 2000);
-    }
+    logger.info('[Monitor] 🔄 %s 第%d笔完成 | 冷却=%ds',
+      state.symbol, tradeNum, SELL_COOLDOWN_SEC);
   }
 
   // ── 辅助工具 ────────────────────────────────────────────────────
@@ -818,7 +796,6 @@ class TokenMonitor extends EventEmitter {
       addedAt:      state.addedAt,
       inPosition:   state.inPosition,
       tradeCount:   state.tradeCount,
-      maxTrades:    MAX_TRADES,
       cooldown:     state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0,
       tradeLogs:    state.tradeLogs,
       tradeRecords: state.tradeRecords,

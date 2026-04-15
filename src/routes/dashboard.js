@@ -12,18 +12,7 @@ router.get('/dashboard', (_req, res) => res.json({
 
 router.get('/tokens', (_req, res) => res.json(monitor.getTokens()));
 
-router.get('/tokens/:address', (req, res) => {
-  const t = monitor.getToken(req.params.address);
-  if (!t) return res.status(404).json({ error: 'not found' });
-  res.json(t);
-});
-
-router.delete('/tokens/:address', async (req, res) => {
-  await monitor.removeToken(req.params.address, 'manual_delete');
-  res.json({ ok: true });
-});
-
-// ── 手动添加代币 ─────────────────────────────────────────────────
+// ── 手动添加代币（必须在 /tokens/:address 之前，避免 :address 匹配 "add"）──
 router.post('/tokens/add', (req, res) => {
   const { address, symbol } = req.body || {};
   if (!address) {
@@ -35,6 +24,17 @@ router.post('/tokens/add', (req, res) => {
     return res.status(409).json({ error: '代币已在监控中', address });
   }
   res.json({ ok: true, address, symbol: sym });
+});
+
+router.get('/tokens/:address', (req, res) => {
+  const t = monitor.getToken(req.params.address);
+  if (!t) return res.status(404).json({ error: 'not found' });
+  res.json(t);
+});
+
+router.delete('/tokens/:address', async (req, res) => {
+  await monitor.removeToken(req.params.address, 'manual_delete');
+  res.json({ ok: true });
 });
 
 router.get('/trades', (_req, res) => {
@@ -54,7 +54,7 @@ router.get('/data-stats', (_req, res) => {
   const signals = dataStore.loadSignals();
   res.json({
     tickFiles: files.length,
-    totalTicks: files.reduce((s, f) => s + Math.floor(f.size / 50), 0), // 估算
+    totalTicks: files.reduce((s, f) => s + Math.floor(f.size / 50), 0),
     tradeCount: trades.length,
     signalCount: signals.length,
     dataDir: dataStore.DATA_DIR,

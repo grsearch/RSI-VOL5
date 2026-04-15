@@ -48,7 +48,7 @@ function runBacktest(ticks, params) {
     trailingStopActivate = 30,   // 上涨 30% 后激活
     trailingStopPct      = -20,  // 峰值回撤 20% 清仓
     tradeSizeSol   = 0.2,
-    maxTrades      = 5,
+    maxTrades      = 99999,
     volBuyMult     = 1.2,
     volSellMult    = 1.2,
     volMinTotal    = 5,
@@ -401,7 +401,7 @@ function gridSearchFromTicks(allTicks) {
       klineSec: 60, volEnabled: true,
       volSellMult: 8888, volMinTotal: 5, volWindowSec: 120,
       volExitConsecutive: 3, volExitRatio: 0.3, volExitLookback: 4,
-      tradeSizeSol: 0.2, maxTrades: 5, sellCooldownSec: 30,
+      tradeSizeSol: 0.2, maxTrades: 99999, sellCooldownSec: 30,
       takeProfitPct: 99999,
       ...combo,
     };
@@ -540,7 +540,7 @@ function main() {
     trailingStopActivate: parseFloat(args['trailing-activate'] || process.env.TRAILING_STOP_ACTIVATE || '30'),
     trailingStopPct:      parseFloat(args['trailing-pct']      || process.env.TRAILING_STOP_PCT      || '-20'),
     tradeSizeSol:       parseFloat(args['trade-size']     || process.env.TRADE_SIZE_SOL || '0.2'),
-    maxTrades:          parseInt(args['max-trades']       || process.env.MAX_TRADES_PER_TOKEN || '5', 10),
+    maxTrades:          parseInt(args['max-trades'] || '99999', 10),
   };
 
   console.log('📋 回测参数：');
@@ -552,7 +552,7 @@ function main() {
     params.volExitConsecutive, params.volExitRatio, params.takeProfitPct, params.stopLossPct);
   console.log('   移动止损: %s  激活=+%d%%  回撤=%d%%',
     params.trailingStopEnabled ? '开启' : '关闭', params.trailingStopActivate, params.trailingStopPct);
-  console.log('   跳过前 %d 根K线  最大交易 %d 次/token\n', params.skipFirstCandles, params.maxTrades);
+  console.log('   跳过前 %d 根K线\n', params.skipFirstCandles);
 
   // 筛选 token
   let filesToTest = tickFiles;

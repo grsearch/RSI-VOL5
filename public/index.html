@@ -195,10 +195,6 @@
         <input type="number" id="bt-decaycons" value="3" min="1" max="10" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:13px">
       </div>
       <div>
-        <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px">最大交易次数</label>
-        <input type="number" id="bt-maxtrades" value="5" min="1" max="20" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:13px">
-      </div>
-      <div>
         <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px">卖出冷却(秒)</label>
         <input type="number" id="bt-cooldown" value="30" min="0" max="300" step="5" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:13px">
       </div>
@@ -397,7 +393,7 @@ function handleTick(d){
     <td class="${sig.toLowerCase()}">${sig}</td>
     <td style="color:#8b949e;font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${d.reason||''}">${d.reason||''}</td>
     <td>${d.closedCount??'-'}</td>
-    <td style="font-size:11px">${d.tradeCount||0}/${d.maxTrades||5}</td>
+    <td style="font-size:11px">${d.tradeCount||0}笔</td>
     <td>${posStr}</td>
     <td><button onclick="deleteToken('${d.address}')" style="background:#4d1c1c;border:1px solid #f85149;color:#f85149;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px" title="移除监控">✕</button></td>
   `;
@@ -644,7 +640,6 @@ function runBacktest() {
     skipFirstCandles:   parseInt(document.getElementById('bt-skip').value),
     volExitRatio:       parseFloat(document.getElementById('bt-decayratio').value),
     volExitConsecutive: parseInt(document.getElementById('bt-decaycons').value),
-    maxTrades:          parseInt(document.getElementById('bt-maxtrades').value),
     sellCooldownSec:    parseInt(document.getElementById('bt-cooldown').value),
     volEnabled:         true,
     tradeSizeSol:       0.2,

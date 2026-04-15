@@ -157,8 +157,7 @@ server.listen(PORT, () => {
     process.env.STOP_LOSS_PCT      || '-10',
     process.env.SKIP_FIRST_CANDLES || '8',
     process.env.SL_POLL_SEC        || '60');
-  logger.info('   最大交易=%s次/token  卖出冷却=%ss',
-    process.env.MAX_TRADES_PER_TOKEN  || '5',
+  logger.info('   卖出冷却=%ss',
     process.env.SELL_COOLDOWN_SEC     || '30');
 
   // 连接信息
