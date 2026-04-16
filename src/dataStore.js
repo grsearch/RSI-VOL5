@@ -16,6 +16,7 @@ const DATA_DIR   = process.env.DRY_RUN_DATA_DIR || './data';
 const TICKS_DIR  = path.join(DATA_DIR, 'ticks');
 const TRADES_FILE  = path.join(DATA_DIR, 'trades.json');
 const SIGNALS_FILE = path.join(DATA_DIR, 'signals.json');
+const TOKENS_FILE  = path.join(DATA_DIR, 'tokens.json');
 
 // 初始化目录
 function init() {
@@ -27,11 +28,32 @@ function init() {
   });
 
   // 初始化文件
-  [TRADES_FILE, SIGNALS_FILE].forEach(file => {
+  [TRADES_FILE, SIGNALS_FILE, TOKENS_FILE].forEach(file => {
     if (!fs.existsSync(file)) {
       fs.writeFileSync(file, '[]', 'utf-8');
     }
   });
+}
+
+// ── Token 列表持久化 ──────────────────────────────────────────────
+
+function saveTokens(tokens) {
+  try {
+    // tokens: [{ address, symbol, meta }]
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), 'utf-8');
+  } catch (err) {
+    logger.error('[DataStore] saveTokens 失败: %s', err.message);
+  }
+}
+
+function loadTokens() {
+  try {
+    if (fs.existsSync(TOKENS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
+      if (Array.isArray(data)) return data;
+    }
+  } catch (_) {}
+  return [];
 }
 
 // ── Tick 数据存储 ──────────────────────────────────────────────────
@@ -198,5 +220,7 @@ module.exports = {
   loadSignals,
   loadTicks,
   listTickFiles,
+  saveTokens,
+  loadTokens,
   DATA_DIR,
 };

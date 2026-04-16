@@ -13,18 +13,18 @@
 //   BUY : RSI(7) < 35（超卖区）+ totalVol ≥ 15 SOL + buyVol ≥ 1.2×sellVol
 //   SELL: RSI 下穿 70 / RSI > 80 / 止盈 / 止损 / 量能萎缩出场
 
-const RSI_PERIOD   = parseInt(process.env.RSI_PERIOD       || '9',  10);
+const RSI_PERIOD   = parseInt(process.env.RSI_PERIOD       || '7',  10);
 const RSI_BUY      = parseFloat(process.env.RSI_BUY_LEVEL  || '30');
 const RSI_SELL     = parseFloat(process.env.RSI_SELL_LEVEL  || '70');
 const RSI_PANIC    = parseFloat(process.env.RSI_PANIC_LEVEL || '80');
-const KLINE_SEC    = parseInt(process.env.KLINE_INTERVAL_SEC || '60', 10);
+const KLINE_SEC    = parseInt(process.env.KLINE_INTERVAL_SEC || '300', 10);
 
 // 量能参数
 const VOL_ENABLED         = (process.env.VOL_ENABLED || 'true') === 'true';
 const VOL_BUY_MULT        = parseFloat(process.env.VOL_BUY_MULT          || '1.2');
-const VOL_SELL_MULT       = parseFloat(process.env.VOL_SELL_MULT         || '1.2'); // sellVol >= N × buyVol 触发卖出
+const VOL_SELL_MULT       = parseFloat(process.env.VOL_SELL_MULT         || '999'); // sellVol >= N × buyVol 触发卖出（默认999=禁用）
 const VOL_MIN_TOTAL       = parseFloat(process.env.VOL_MIN_TOTAL         || '15');  // 最低总成交量(SOL) // buyVol >= N × sellVol 才买入
-const VOL_WINDOW_SEC      = parseInt(process.env.VOL_WINDOW_SEC       || '120', 10);
+const VOL_WINDOW_SEC      = parseInt(process.env.VOL_WINDOW_SEC       || '300', 10);
 const VOL_EXIT_CONSECUTIVE = parseInt(process.env.VOL_EXIT_CONSECUTIVE || '2', 10);
 const VOL_EXIT_RATIO      = parseFloat(process.env.VOL_EXIT_RATIO     || '1.0');
 const VOL_EXIT_LOOKBACK   = parseInt(process.env.VOL_EXIT_LOOKBACK    || '4', 10);

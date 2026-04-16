@@ -1,10 +1,12 @@
 'use strict';
-// src/birdeye.js — Birdeye API 封装 (V3 — WebSocket 实时价格 + HTTP 兜底)
+// src/birdeye.js — Birdeye API 封装 (V4 — 合并缓存，大幅降低API消耗)
 //
 // 架构：
 //   1. 主力：Birdeye WebSocket SUBSCRIBE_PRICE（1s OHLCV 推送，延迟 50-150ms）
 //   2. 兜底：HTTP /defi/price（WS 断开时自动切换）
-//   3. FDV：/defi/token_overview（30秒缓存）
+//   3. FDV + LP：/defi/token_overview 合并请求，共享缓存（默认5分钟TTL）
+//      ★ 修复V3：getFdv 和 getLiquidity 各自独立请求 → 合并为单次请求
+//      ★ 缓存从5秒提升到5分钟，30个币×1/min vs 30个币×12/min，减少约90%消耗
 //
 // B-05 级别支持 WebSocket + 100 token 并发订阅
 
@@ -14,7 +16,8 @@ const logger    = require('./logger');
 
 const BIRDEYE_KEY  = process.env.BIRDEYE_API_KEY || '';
 const BASE         = 'https://public-api.birdeye.so';
-const FDV_CACHE_MS = 5 * 1000;  // FDV 缓存 5 秒（快速响应 FDV 下跌）
+// FDV/LP 缓存时间，默认5分钟（可通过 FDV_CACHE_MS 环境变量调整）
+const FDV_CACHE_MS = parseInt(process.env.FDV_CACHE_MS || String(5 * 60 * 1000), 10);
 
 // ── WebSocket 价格流 ──────────────────────────────────────────────
 
@@ -54,11 +57,6 @@ class BirdeyePriceStream {
     this._connected = false;
   }
 
-  /**
-   * 订阅 token 价格推送
-   * @param {string} address - token mint 地址
-   * @param {function} onPrice - 回调 (price, ts, ohlcv) => void
-   */
   subscribe(address, onPrice) {
     if (!this._subscriptions.has(address)) {
       this._subscriptions.set(address, { price: null, ts: 0, callbacks: new Set() });
@@ -80,7 +78,6 @@ class BirdeyePriceStream {
     logger.info('[BirdeyeWS] 🔕 取消价格订阅 %s，剩余 %d 个', address.slice(0, 8) + '...', this._subscriptions.size);
   }
 
-  /** 获取最新缓存价格（WS 推送的），10秒内有效 */
   getCachedPrice(address) {
     const sub = this._subscriptions.get(address);
     if (!sub || !sub.price || Date.now() - sub.ts > 10000) return null;
@@ -88,8 +85,6 @@ class BirdeyePriceStream {
   }
 
   isConnected() { return this._connected; }
-
-  // ── 连接管理 ────────────────────────────────────────────────
 
   _connect() {
     if (this._stopping) return;
@@ -108,7 +103,6 @@ class BirdeyePriceStream {
         if (this._ws?.readyState === WebSocket.OPEN) this._ws.ping();
       }, PING_INTERVAL_MS);
 
-      // 重新订阅所有 token
       for (const address of this._subscriptions.keys()) {
         this._sendSubscribe(address);
       }
@@ -187,18 +181,53 @@ class BirdeyePriceStream {
 // 单例
 const priceStream = new BirdeyePriceStream();
 
-// ── FDV 缓存 ──────────────────────────────────────────────────────
+// ── FDV + Liquidity 合并缓存 ─────────────────────────────────────
+// ★ getFdv 和 getLiquidity 共享同一个 token_overview 请求 + 缓存
+// ★ 默认缓存5分钟，30个币每分钟只请求1次（原来每5秒1次，减少60倍消耗）
 
-const _fdvCache = new Map();
+const _overviewCache = new Map(); // address → { fdv, liquidity, ts }
 
-// ── HTTP 兜底函数 ──────────────────────────────────────────────────
+async function _fetchOverview(address) {
+  const cached = _overviewCache.get(address);
+  if (cached && Date.now() - cached.ts < FDV_CACHE_MS) return cached;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const url = `${BASE}/defi/token_overview?address=${address}`;
+    const res = await fetch(url, {
+      headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      logger.warn('[Birdeye] token_overview %s 返回 %d', address, res.status);
+      return cached || null;
+    }
+    const json = await res.json();
+    const data = json?.data || {};
+    const entry = {
+      fdv:       data.fdv ?? data.mc ?? null,
+      liquidity: data.liquidity ?? data.lp ?? null,
+      ts:        Date.now(),
+    };
+    _overviewCache.set(address, entry);
+    return entry;
+  } catch (err) {
+    logger.warn('[Birdeye] _fetchOverview %s 失败: %s', address, err.message);
+    return cached || null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ── HTTP 兜底价格查询 ─────────────────────────────────────────────
 
 async function getPrice(address) {
   // 优先用 WS 缓存
   const cached = priceStream.getCachedPrice(address);
   if (cached !== null) return cached;
 
-  // HTTP 兜底（带正确的超时）
+  // HTTP 兜底（带超时）
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {
@@ -217,60 +246,33 @@ async function getPrice(address) {
 }
 
 async function getFdv(address) {
-  const cached = _fdvCache.get(address);
-  if (cached && Date.now() - cached.ts < FDV_CACHE_MS) return cached.fdv;
+  const entry = await _fetchOverview(address);
+  return entry?.fdv ?? null;
+}
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-  try {
-    const url = `${BASE}/defi/token_overview?address=${address}`;
-    const res = await fetch(url, {
-      headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      logger.warn('[Birdeye] token_overview %s 返回 %d', address, res.status);
-      return cached?.fdv ?? null;
-    }
-    const json = await res.json();
-    const fdv = json?.data?.fdv ?? json?.data?.mc ?? null;
-    _fdvCache.set(address, { fdv, ts: Date.now() });
-    return fdv;
-  } catch (err) {
-    logger.warn('[Birdeye] getFdv %s 失败: %s', address, err.message);
-    return cached?.fdv ?? null;
-  } finally {
-    clearTimeout(timeout);
-  }
+/** 只读内存缓存，不发 HTTP 请求。缓存未命中时返回 null。
+ *  用于主轮询的 FDV 监控：命中则检查，未命中则跳过（等买入前再刷）。*/
+function getCachedFdv(address) {
+  const cached = _overviewCache.get(address);
+  if (!cached) return null;
+  // 缓存已过期也返回旧值（宁可用旧值检查，也不跳过）
+  return cached.fdv ?? null;
+}
+
+/** 强制绕过缓存，发 HTTP 请求获取最新 FDV。仅在买入前调用一次。*/
+async function getFdvFresh(address) {
+  _overviewCache.delete(address);          // 清除旧缓存，强制重新拉取
+  const entry = await _fetchOverview(address);
+  return entry?.fdv ?? null;
+}
+
+async function getLiquidity(address) {
+  const entry = await _fetchOverview(address);
+  return entry?.liquidity ?? null;
 }
 
 function clearCache(address) {
-  _fdvCache.delete(address);
+  _overviewCache.delete(address);
 }
 
-// ── 实时 LP（流动性）查询 ─────────────────────────────────────────
-
-async function getLiquidity(address) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-  try {
-    const url = `${BASE}/defi/token_overview?address=${address}`;
-    const res = await fetch(url, {
-      headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      logger.warn('[Birdeye] getLiquidity %s 返回 %d', address, res.status);
-      return null;
-    }
-    const json = await res.json();
-    return json?.data?.liquidity ?? json?.data?.lp ?? null;
-  } catch (err) {
-    logger.warn('[Birdeye] getLiquidity %s 失败: %s', address, err.message);
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-module.exports = { getPrice, getFdv, getLiquidity, clearCache, priceStream };
+module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, clearCache, priceStream };

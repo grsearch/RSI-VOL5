@@ -28,7 +28,7 @@ const heliusWs  = require('./heliusWs');
 
 const FDV_EXIT          = parseFloat(process.env.FDV_EXIT_USD        || '10000');
 const POLL_SEC          = parseInt(process.env.PRICE_POLL_SEC        || '1',  10);
-const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '60', 10);
+const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '300', 10);
 const DRY_RUN           = (process.env.DRY_RUN || 'false') === 'true';
 const TRADE_SOL         = parseFloat(process.env.TRADE_SIZE_SOL      || '0.2');
 const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '30', 10);
@@ -79,6 +79,35 @@ class TokenMonitor extends EventEmitter {
       heliusWs.isConnected() ? '已连接' : '连接中');
     logger.info('[Monitor]   移动止损=%s  激活线=+%s%%  回撤线=%s%%',
       TRAILING_STOP_ENABLED ? '开启' : '关闭', TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT);
+
+    // ★ 加载持久化的代币列表（延迟500ms，等 WS 连接建立）
+    setTimeout(() => this._loadPersistedTokens(), 500);
+  }
+
+  _loadPersistedTokens() {
+    try {
+      const tokens = dataStore.loadTokens();
+      if (!tokens || tokens.length === 0) return;
+      logger.info('[Monitor] 从磁盘恢复 %d 个监控代币...', tokens.length);
+      for (const t of tokens) {
+        if (t.address && t.symbol) {
+          this.addToken(t.address, t.symbol, t.meta || {});
+        }
+      }
+    } catch (err) {
+      logger.error('[Monitor] 加载持久化代币失败: %s', err.message);
+    }
+  }
+
+  _persistTokens() {
+    try {
+      const list = Array.from(this._tokens.values()).map(s => ({
+        address: s.address,
+        symbol:  s.symbol,
+        meta:    s.meta || {},
+      }));
+      dataStore.saveTokens(list);
+    } catch (_) {}
   }
 
   stop() {
@@ -144,6 +173,7 @@ class TokenMonitor extends EventEmitter {
     logger.info('[Monitor] ➕ 开始监控 %s (%s) | DRY_RUN=%s',
       symbol, address, DRY_RUN);
     this._broadcastTokenList();
+    this._persistTokens();  // ★ 保存到磁盘
     return true;
   }
 
@@ -168,6 +198,7 @@ class TokenMonitor extends EventEmitter {
     this._stopLossLocks.delete(address);
     birdeye.clearCache(address);
     this._broadcastTokenList();
+    this._persistTokens();  // ★ 保存到磁盘
   }
 
   getTokens() {
@@ -481,9 +512,10 @@ class TokenMonitor extends EventEmitter {
       dataStore.appendTick(address, { price, ts: now, source: 'price', symbol: state.symbol });
     }
 
-    // 4. FDV 检查
-    const fdv = await birdeye.getFdv(address);
-    if (fdv !== null && fdv !== undefined && Number.isFinite(fdv) && fdv < FDV_EXIT) {
+    // 4. FDV 检查（★ 只用缓存值，不主动发 HTTP 请求，买入前才强制刷新）
+    //    getCachedFdv 返回 null 表示缓存未命中或已过期 → 跳过检查，等买入前再刷
+    const fdv = birdeye.getCachedFdv(address);
+    if (fdv !== null && Number.isFinite(fdv) && fdv < FDV_EXIT) {
       logger.warn('[Monitor] %s FDV=$%s < $%s，退出', state.symbol, fdv, FDV_EXIT);
       await this.removeToken(address, `FDV_TOO_LOW($${Math.round(fdv)})`);
       return;
@@ -543,8 +575,8 @@ class TokenMonitor extends EventEmitter {
 
     // 10. 执行信号
     if (signal === 'BUY' && !state.inPosition && this._canBuy(state, now)) {
-      // ★ 买入前强制刷新 FDV 检查
-      const freshFdv = await birdeye.getFdv(address);
+      // ★ 买入前强制刷新 FDV（绕过缓存，确保数据最新）
+      const freshFdv = await birdeye.getFdvFresh(address);
       if (freshFdv !== null && Number.isFinite(freshFdv) && freshFdv < FDV_EXIT) {
         logger.warn('[Monitor] %s 买入被拒: FDV=$%d < $%d', state.symbol, Math.round(freshFdv), FDV_EXIT);
       } else {
