@@ -30,10 +30,12 @@ const HELIUS_API_KEY         = process.env.HELIUS_API_KEY || '';
 const HELIUS_RPC_URL         = process.env.HELIUS_RPC_URL || '';
 
 // "auto" | "token" | "pump"
-// auto = 代币数 ≤ HELIUS_TOKEN_LIMIT 用 token 模式，超过自动切换 pump
-const CFG_SUB_MODE    = (process.env.HELIUS_SUB_MODE || 'auto').toLowerCase();
+// token = 按 mint 精准订阅，不管代币在哪个 AMM 上交易都能收到（默认，适合混合AMM）
+// auto  = 代币数 ≤ HELIUS_TOKEN_LIMIT 用 token，超过自动切 pump（仅适合纯 Pump.fun 代币）
+// pump  = 强制 Pump AMM 单订阅（只适合全部代币都在 pumpAMM 上交易的场景）
+const CFG_SUB_MODE    = (process.env.HELIUS_SUB_MODE || 'token').toLowerCase();
 // auto 模式下，超过此数量自动切换到 pump 单订阅
-const TOKEN_LIMIT     = parseInt(process.env.HELIUS_TOKEN_LIMIT || '15', 10);
+const TOKEN_LIMIT     = parseInt(process.env.HELIUS_TOKEN_LIMIT || '50', 10);
 
 function getWsUrl() {
   if (HELIUS_GATEKEEPER_URL) {
