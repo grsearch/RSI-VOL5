@@ -221,13 +221,24 @@ async function _fetchOverview(address) {
 }
 
 // ── HTTP 兜底价格查询 ─────────────────────────────────────────────
+// ★ 双层缓存：WS缓存（10s）→ HTTP本地缓存（30s）→ 真实HTTP请求
+// 避免BirdeyeWS推送不活跃的币（低流动性）每秒发HTTP
+
+const _priceHttpCache = new Map(); // address → { price, ts }
+const PRICE_HTTP_CACHE_MS = parseInt(process.env.PRICE_HTTP_CACHE_MS || '30000', 10); // 默认30秒
 
 async function getPrice(address) {
-  // 优先用 WS 缓存
-  const cached = priceStream.getCachedPrice(address);
-  if (cached !== null) return cached;
+  // 1. 优先用 WS 缓存（最新，10秒有效）
+  const wsCached = priceStream.getCachedPrice(address);
+  if (wsCached !== null) return wsCached;
 
-  // HTTP 兜底（带超时）
+  // 2. HTTP 本地缓存（30秒，防止低流动性币每秒发请求）
+  const httpCached = _priceHttpCache.get(address);
+  if (httpCached && Date.now() - httpCached.ts < PRICE_HTTP_CACHE_MS) {
+    return httpCached.price;
+  }
+
+  // 3. 真实 HTTP 请求
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {
@@ -239,7 +250,9 @@ async function getPrice(address) {
     if (!res.ok) throw new Error(`Birdeye price error: ${res.status}`);
     const json = await res.json();
     if (!json.success || !json.data) throw new Error('Birdeye price 返回异常');
-    return json.data.value;
+    const price = json.data.value;
+    _priceHttpCache.set(address, { price, ts: Date.now() });
+    return price;
   } finally {
     clearTimeout(timeout);
   }
@@ -273,6 +286,7 @@ async function getLiquidity(address) {
 
 function clearCache(address) {
   _overviewCache.delete(address);
+  _priceHttpCache.delete(address);
 }
 
 module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, clearCache, priceStream };

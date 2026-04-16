@@ -495,20 +495,36 @@ class TokenMonitor extends EventEmitter {
     if (state._selling) return;
 
     // 1. 获取价格
+    // ★ 优先用 BirdeyeWS 已推送的最新价格（state._lastPriceUsd 由 _onBirdeyePrice 实时更新）
+    //   只有 WS 价格超过 PRICE_STALE_MS 没更新，才发 HTTP 兜底请求
+    //   这样避免每秒对48个币发HTTP，尤其是低流动性币WS长时间不推送的情况
+    const PRICE_STALE_MS = parseInt(process.env.PRICE_STALE_MS || '30000', 10); // 默认30秒
     let price;
-    try {
-      price = await birdeye.getPrice(address);
-    } catch (err) {
-      logger.warn('[Monitor] %s 价格拉取失败: %s', state.symbol, err.message);
-      return;
+    const wsAge = state._lastPriceUsd ? now - state._lastPriceTs : Infinity;
+    if (state._lastPriceUsd && wsAge < PRICE_STALE_MS) {
+      // WS 价格足够新鲜，直接用，不发 HTTP
+      price = state._lastPriceUsd;
+    } else {
+      // WS 价格过期或没有，发 HTTP 兜底
+      try {
+        price = await birdeye.getPrice(address);
+        if (price && price > 0) {
+          state._lastPriceUsd = price;
+          state._lastPriceTs  = now;
+        }
+      } catch (err) {
+        logger.warn('[Monitor] %s 价格拉取失败: %s', state.symbol, err.message);
+        // 如果有旧价格，宁可用旧的继续跑 RSI，不要直接 return
+        if (!state._lastPriceUsd) return;
+        price = state._lastPriceUsd;
+      }
     }
+    if (!price || price <= 0) return;
 
-    // WS 不可用时补 tick
-    if (!state._lastPriceUsd || now - state._lastPriceTs > 5000) {
+    // 2. WS 不可用时补 tick（仅在 HTTP 兜底拉到新价格时才需要，WS 正常时由 _onBirdeyePrice 负责）
+    if (wsAge >= PRICE_STALE_MS) {
       const tick = { price, ts: now, source: 'price' };
       state.ticks.push(tick);
-      state._lastPriceUsd = price;
-      state._lastPriceTs  = now;
       dataStore.appendTick(address, { price, ts: now, source: 'price', symbol: state.symbol });
     }
 
