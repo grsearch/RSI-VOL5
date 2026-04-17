@@ -84,6 +84,13 @@ function flushTicks() {
         }
       }
       existing.push(...newTicks);
+      // ★ V5: 裁剪超过2小时的旧数据（避免47币的JSON文件无限增长）
+      const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+      if (existing.length > 0 && existing[0].ts < cutoff) {
+        const idx = existing.findIndex(t => t.ts >= cutoff);
+        if (idx > 0) existing = existing.slice(idx);
+        else if (idx === -1) existing = [];
+      }
       fs.writeFileSync(file, JSON.stringify(existing), 'utf-8');
       newTicks.length = 0; // 清空缓冲
     } catch (err) {
@@ -95,6 +102,10 @@ function flushTicks() {
 function startFlush() {
   if (_flushTimer) return;
   _flushTimer = setInterval(flushTicks, FLUSH_INTERVAL);
+  // ★ V5: 信号也用缓冲刷盘
+  if (!_signalFlushTimer) {
+    _signalFlushTimer = setInterval(_flushSignals, SIGNAL_FLUSH_INTERVAL);
+  }
   logger.info('[DataStore] 启动 tick 刷盘，间隔 %ds', FLUSH_INTERVAL / 1000);
 }
 
@@ -103,7 +114,12 @@ function stopFlush() {
     clearInterval(_flushTimer);
     _flushTimer = null;
   }
+  if (_signalFlushTimer) {
+    clearInterval(_signalFlushTimer);
+    _signalFlushTimer = null;
+  }
   flushTicks(); // 最后刷一次
+  _flushSignals(); // ★ V5: 信号也刷一次
 }
 
 // ── 交易记录存储 ──────────────────────────────────────────────────
@@ -150,9 +166,18 @@ function loadTrades() {
   return [];
 }
 
-// ── 信号记录存储 ──────────────────────────────────────────────────
+// ── 信号记录存储（★ V5: 缓冲写盘，避免47+币每秒全量读写）──────
+
+const _signalBuffer = [];
+const SIGNAL_FLUSH_INTERVAL = 30 * 1000; // 30秒刷盘
+let _signalFlushTimer = null;
 
 function appendSignal(signalRecord) {
+  _signalBuffer.push(signalRecord);
+}
+
+function _flushSignals() {
+  if (_signalBuffer.length === 0) return;
   try {
     let signals = [];
     if (fs.existsSync(SIGNALS_FILE)) {
@@ -162,12 +187,13 @@ function appendSignal(signalRecord) {
         signals = [];
       }
     }
-    signals.push(signalRecord);
+    signals.push(..._signalBuffer);
+    _signalBuffer.length = 0;
     // 只保留最近5000条
     if (signals.length > 5000) signals = signals.slice(-5000);
     fs.writeFileSync(SIGNALS_FILE, JSON.stringify(signals), 'utf-8');
   } catch (err) {
-    logger.error('[DataStore] appendSignal 失败: %s', err.message);
+    logger.error('[DataStore] _flushSignals 失败: %s', err.message);
   }
 }
 

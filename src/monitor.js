@@ -557,7 +557,13 @@ class TokenMonitor extends EventEmitter {
   async _poll() {
     const now = Date.now();
     const addresses = Array.from(this._tokens.keys());
-    await Promise.allSettled(addresses.map(addr => this._pollOne(addr, now)));
+
+    // ★ V5: 并发控制 — 最多10个同时执行，避免47+币同时发HTTP请求
+    const CONCURRENCY = 10;
+    for (let i = 0; i < addresses.length; i += CONCURRENCY) {
+      const batch = addresses.slice(i, i + CONCURRENCY);
+      await Promise.allSettled(batch.map(addr => this._pollOne(addr, now)));
+    }
     this._scheduleNextPoll();
   }
 
@@ -612,8 +618,13 @@ class TokenMonitor extends EventEmitter {
     }
 
     // 5. 裁剪 ticks（保留最近 60 分钟）
+    // ★ V5: 用 findIndex+splice 替代 while+shift，O(1) vs O(n)
     const cutoff = now - 60 * 60 * 1000;
-    while (state.ticks.length > 0 && state.ticks[0].ts < cutoff) state.ticks.shift();
+    if (state.ticks.length > 0 && state.ticks[0].ts < cutoff) {
+      const idx = state.ticks.findIndex(t => t.ts >= cutoff);
+      if (idx > 0) state.ticks.splice(0, idx);
+      else if (idx === -1) state.ticks.length = 0;  // 全部过期
+    }
 
     // 6. 聚合 K 线
     const { closed: rawClosedCandles, current: currentCandle } = buildCandles(state.ticks, KLINE_SEC);

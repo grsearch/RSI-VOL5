@@ -309,14 +309,10 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
                reason: sl.reason, volume: volumeInfo };
     }
 
-    // 4. 卖压超过买压：sellVol >= VOL_SELL_MULT × buyVol
-    if (VOL_ENABLED && winTotal > 0 && winSell >= winBuy * VOL_SELL_MULT && lastCandleTs !== lastSellCandle) {
-      const mult = winBuy > 0 ? (winSell / winBuy).toFixed(1) : '∞';
-      tokenState._lastSellCandle = lastCandleTs;
-      updateState();
-      return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
-               reason: `SELL_PRESSURE(sell=${winSell.toFixed(2)}>=${(winBuy*VOL_SELL_MULT).toFixed(2)},${mult}x,${VOL_WINDOW_SEC}s)`, volume: volumeInfo };
-    }
+    // 4. 卖压超过买压 — ★ V5: 已禁用（VOL_SELL_MULT 设999也仍会判断，彻底跳过）
+    // if (VOL_ENABLED && winTotal > 0 && winSell >= winBuy * VOL_SELL_MULT && lastCandleTs !== lastSellCandle) {
+    //   ...
+    // }
 
     // 5. 量能萎缩出场
     const volDecay = checkVolumeDecay(closedCandles, tokenState);
