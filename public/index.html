@@ -264,7 +264,7 @@
 
 <script>
 const rows   = {};
-const logMax = 100;
+const logMax = 50;  // ★ V5: 从100减到50
 
 // ── 成交记录分页 ──
 const REC_PAGE_SIZE = 30;
@@ -280,6 +280,18 @@ function fmtFdv(v){ if(v==null||v===undefined)return'-'; if(v>=1e6)return'$'+(v/
 function addrShort(a){ return a ? a.slice(0,4)+'...'+a.slice(-4) : '-' }
 function gmgnUrl(a){ return `https://gmgn.ai/sol/token/${a}` }
 
+// ★ V5: tick 缓冲 + RAF 批量渲染（核心性能修复）
+const _tickBuffer = new Map();  // address → latest tick data
+let _rafPending = false;
+
+function _flushTickBuffer() {
+  _rafPending = false;
+  for (const [address, d] of _tickBuffer.entries()) {
+    _renderTickRow(d);
+  }
+  _tickBuffer.clear();
+}
+
 function connect(){
   const ws = new WebSocket(`ws://${location.host}`);
   document.getElementById('ws-status').textContent = '⚡ 连接中...';
@@ -288,7 +300,6 @@ function connect(){
   ws.onopen = () => {
     document.getElementById('ws-status').textContent = '✅ 已连接';
     document.getElementById('ws-status').className = 'badge green';
-    // 每次连接（含重连）都刷新全量数据
     refreshAll();
   };
 
@@ -300,10 +311,16 @@ function connect(){
 
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
-    if (d.type === 'tick')         handleTick(d);
+    if (d.type === 'tick') {
+      // ★ V5: 只缓冲最新tick，用RAF合并渲染
+      _tickBuffer.set(d.address, d);
+      if (!_rafPending) {
+        _rafPending = true;
+        requestAnimationFrame(_flushTickBuffer);
+      }
+    }
     if (d.type === 'trade_log')    addLogRow(d);
     if (d.type === 'trade_record') {
-      // 更新或插入记录
       const idx = _allRecords.findIndex(r => r.id === d.id);
       if (idx >= 0) { _allRecords[idx] = d; } else { _allRecords.unshift(d); }
       renderRecordsPage();
@@ -349,7 +366,6 @@ function refreshLogs() {
 
 function refreshRecords() {
   fetch('/api/trade-records').then(r=>r.json()).then(records=>{
-    // 按买入时间倒序（最新的在前）
     records.sort((a, b) => (b.buyAt || 0) - (a.buyAt || 0));
     _allRecords = records;
     renderRecordsPage();
@@ -358,46 +374,73 @@ function refreshRecords() {
   }).catch(()=>{});
 }
 
-// ── 定时自动刷新（兜底，防止 WS 推送遗漏） ──
-setInterval(refreshRecords, 15000);   // 成交记录 15秒刷新
-setInterval(refreshLogs, 30000);      // 交易日志 30秒刷新
+// ★ V5: 降低自动刷新频率（从15s/30s → 60s/120s）
+setInterval(refreshRecords, 60000);
+setInterval(refreshLogs, 120000);
 
-function handleTick(d){
+// ★ V5: 用单元格级更新代替 innerHTML 全行重建
+function _ensureTickRow(address) {
+  let tr = document.getElementById('row-' + address);
+  if (tr) return tr;
   const tbody = document.querySelector('#tbl-tokens tbody');
-  let tr = document.getElementById('row-' + d.address);
-  if (!tr){
-    tr = document.createElement('tr');
-    tr.id = 'row-' + d.address;
-    tbody.prepend(tr);
-    rows[d.address] = true;
+  tr = document.createElement('tr');
+  tr.id = 'row-' + address;
+  // 预创建14个 td 单元格，后续只更新内容
+  for (let i = 0; i < 14; i++) {
+    tr.appendChild(document.createElement('td'));
   }
+  tbody.prepend(tr);
+  rows[address] = true;
+  return tr;
+}
+
+function _renderTickRow(d) {
+  const tr = _ensureTickRow(d.address);
+  const cells = tr.children;
   const sig = d.signal || 'none';
   const rsi = d.rsi;
   const bv = d.volume?.buyVol ?? 0;
   const sv = d.volume?.sellVol ?? 0;
   const bsStr = (bv+sv) > 0 ? `${bv.toFixed(1)}/${sv.toFixed(1)}` : '-';
-  const coolStr = d.cooldown > 0 ? `<span class="badge yellow">${d.cooldown}s</span>` : '';
   const posStr = d.inPosition
     ? '<span class="badge green">持仓</span>'
     : (d.cooldown > 0 ? '<span class="badge yellow">冷却</span>' : '<span class="badge gray">观望</span>');
 
-  tr.innerHTML = `
-    <td>${d.symbol}</td>
-    <td><a href="${gmgnUrl(d.address)}" target="_blank" class="gmgn" title="${d.address}">${addrShort(d.address)}</a></td>
-    <td>${fmt(d.price,8)}</td>
-    <td class="fdv-val">${fmtFdv(d.fdv)}</td>
-    <td class="lp-val">${fmtFdv(d.lp)}</td>
-    <td class="${rsiClass(rsi)}">${rsi==null?'预热':rsi.toFixed(2)}</td>
-    <td class="${rsiClass(d.prevRsi)}">${d.prevRsi==null?'-':d.prevRsi.toFixed(2)}</td>
-    <td class="${volClass(bv,sv)}" title="Buy/Sell SOL (${d.volume?.windowSec||30}s)">${bsStr}</td>
-    <td class="${sig.toLowerCase()}">${sig}</td>
-    <td style="color:#8b949e;font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${d.reason||''}">${d.reason||''}</td>
-    <td>${d.closedCount??'-'}</td>
-    <td style="font-size:11px">${d.tradeCount||0}笔</td>
-    <td>${posStr}</td>
-    <td><button onclick="deleteToken('${d.address}')" style="background:#4d1c1c;border:1px solid #f85149;color:#f85149;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px" title="移除监控">✕</button></td>
-  `;
+  // ★ 只更新变化的单元格内容（避免innerHTML重建整行）
+  cells[0].textContent = d.symbol;
+  // 合约地址（含链接，只在首次设置）
+  if (!cells[1].firstChild || cells[1].firstChild.tagName !== 'A') {
+    cells[1].innerHTML = `<a href="${gmgnUrl(d.address)}" target="_blank" class="gmgn" title="${d.address}">${addrShort(d.address)}</a>`;
+  }
+  cells[2].textContent = fmt(d.price, 8);
+  cells[3].textContent = fmtFdv(d.fdv); cells[3].className = 'fdv-val';
+  cells[4].textContent = fmtFdv(d.lp);  cells[4].className = 'lp-val';
+  cells[5].textContent = rsi == null ? '预热' : rsi.toFixed(2);
+  cells[5].className = rsiClass(rsi);
+  cells[6].textContent = d.prevRsi == null ? '-' : d.prevRsi.toFixed(2);
+  cells[6].className = rsiClass(d.prevRsi);
+  cells[7].textContent = bsStr;
+  cells[7].className = volClass(bv, sv);
+  cells[7].title = `Buy/Sell SOL (${d.volume?.windowSec||30}s)`;
+  cells[8].textContent = sig;
+  cells[8].className = sig.toLowerCase();
+  cells[9].textContent = d.reason || '';
+  cells[9].style.cssText = 'color:#8b949e;font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+  cells[9].title = d.reason || '';
+  cells[10].textContent = d.closedCount ?? '-';
+  cells[11].textContent = (d.tradeCount || 0) + '笔';
+  cells[11].style.fontSize = '11px';
+  cells[12].innerHTML = posStr;
+  // 删除按钮只在首次设置
+  if (!cells[13].firstChild) {
+    cells[13].innerHTML = `<button onclick="deleteToken('${d.address}')" style="background:#4d1c1c;border:1px solid #f85149;color:#f85149;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px" title="移除监控">✕</button>`;
+  }
   updateCount();
+}
+
+function handleTick(d){
+  // ★ V5: 不再直接调用，由 _flushTickBuffer 通过 RAF 调用 _renderTickRow
+  _renderTickRow(d);
 }
 
 function handleTokenList(tokens){

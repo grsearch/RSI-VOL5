@@ -57,6 +57,7 @@ class TokenMonitor extends EventEmitter {
     // 止损锁：防止同一 token 并发触发多次止损
     this._stopLossLocks = new Set();
     this._slPollTimer = null;  // 独立止损轮询
+    this._persistTimer = null; // ★ V5: 定时持久化
   }
 
   start() {
@@ -82,6 +83,9 @@ class TokenMonitor extends EventEmitter {
 
     // ★ 加载持久化的代币列表（延迟500ms，等 WS 连接建立）
     setTimeout(() => this._loadPersistedTokens(), 500);
+
+    // ★ V5: 定时持久化状态（每60秒），确保崩溃/重启后不丢失RSI预热和持仓
+    this._persistTimer = setInterval(() => this._persistTokens(), 60000);
   }
 
   _loadPersistedTokens() {
@@ -91,7 +95,53 @@ class TokenMonitor extends EventEmitter {
       logger.info('[Monitor] 从磁盘恢复 %d 个监控代币...', tokens.length);
       for (const t of tokens) {
         if (t.address && t.symbol) {
-          this.addToken(t.address, t.symbol, t.meta || {});
+          const added = this.addToken(t.address, t.symbol, t.meta || {});
+          if (!added) continue;
+
+          // ★ V5: 恢复保存的运行状态
+          const state = this._tokens.get(t.address);
+          if (!state) continue;
+
+          // 恢复 FDV/LP
+          if (t.fdv != null) state.fdv = t.fdv;
+          if (t.lp != null) state.lp = t.lp;
+
+          // 恢复 RSI 预热状态（关键！省去 SKIP_FIRST_CANDLES × KLINE_SEC 的预热时间）
+          if (Number.isFinite(t._rsiAvgGain))    state._rsiAvgGain    = t._rsiAvgGain;
+          if (Number.isFinite(t._rsiAvgLoss))    state._rsiAvgLoss    = t._rsiAvgLoss;
+          if (Number.isFinite(t._rsiLastClose))   state._rsiLastClose  = t._rsiLastClose;
+          if (t._rsiLastCandleTs != null)         state._rsiLastCandleTs = t._rsiLastCandleTs;
+
+          // 恢复持仓状态
+          if (t.inPosition && t.position) {
+            state.inPosition = true;
+            state.position   = t.position;
+            state.tradeCount = t.tradeCount || 0;
+            logger.info('[Monitor] ♻️ 恢复 %s 持仓状态: entry=%.6f SOL=%.4f',
+              t.symbol, t.position.entryPriceUsd, t.position.solIn);
+          } else {
+            state.tradeCount = t.tradeCount || 0;
+          }
+
+          // 恢复冷却期
+          if (t._sellCooldownUntil && t._sellCooldownUntil > Date.now()) {
+            state._sellCooldownUntil = t._sellCooldownUntil;
+          }
+
+          // ★ V5: 从磁盘加载历史 ticks 恢复 K 线数据
+          try {
+            const savedTicks = dataStore.loadTicks(t.address);
+            if (savedTicks && savedTicks.length > 0) {
+              // 只加载最近60分钟的 ticks
+              const cutoff = Date.now() - 60 * 60 * 1000;
+              const recentTicks = savedTicks.filter(tk => tk.ts > cutoff);
+              if (recentTicks.length > 0) {
+                state.ticks = recentTicks;
+                logger.info('[Monitor] ♻️ 恢复 %s %d 条历史tick（最近60分钟）',
+                  t.symbol, recentTicks.length);
+              }
+            }
+          } catch (_) {}
         }
       }
     } catch (err) {
@@ -105,6 +155,18 @@ class TokenMonitor extends EventEmitter {
         address: s.address,
         symbol:  s.symbol,
         meta:    s.meta || {},
+        // ★ V5: 保存运行状态，重启后不丢失
+        fdv:            s.fdv,
+        lp:             s.lp,
+        inPosition:     s.inPosition,
+        position:       s.position,
+        tradeCount:     s.tradeCount,
+        _sellCooldownUntil: s._sellCooldownUntil,
+        // ★ V5: 保存 RSI 预热状态，重启后不需要重新预热
+        _rsiAvgGain:    s._rsiAvgGain,
+        _rsiAvgLoss:    s._rsiAvgLoss,
+        _rsiLastClose:  s._rsiLastClose,
+        _rsiLastCandleTs: s._rsiLastCandleTs,
       }));
       dataStore.saveTokens(list);
     } catch (_) {}
@@ -114,6 +176,8 @@ class TokenMonitor extends EventEmitter {
     this._started = false;
     if (this._pollTimer) { clearTimeout(this._pollTimer); this._pollTimer = null; }
     if (this._slPollTimer) { clearInterval(this._slPollTimer); this._slPollTimer = null; }
+    if (this._persistTimer) { clearInterval(this._persistTimer); this._persistTimer = null; }
+    this._persistTokens();  // ★ V5: 关闭前最后保存一次
     birdeye.priceStream.stop();
     heliusWs.stop();
     dataStore.stopFlush();
@@ -377,7 +441,17 @@ class TokenMonitor extends EventEmitter {
       if (!state.inPosition || state._selling || this._stopLossLocks.has(address)) continue;
 
       try {
-        const price = await birdeye.getPrice(address);
+        // ★ V5: 优先用 WS 缓存价格（10秒内有效），避免对所有持仓币发 HTTP
+        //   只有 WS 价格过期超过60秒才发 HTTP 兜底
+        let price = birdeye.priceStream.getCachedPrice(address);
+        if (price === null) {
+          // WS 缓存失效，检查 state 里最近的价格是否够新（60秒内）
+          if (state._lastPriceUsd && Date.now() - state._lastPriceTs < 60000) {
+            price = state._lastPriceUsd;
+          } else {
+            price = await birdeye.getPrice(address);
+          }
+        }
         if (!price || price <= 0) continue;
 
         state._lastPriceUsd = price;
@@ -498,7 +572,7 @@ class TokenMonitor extends EventEmitter {
     // ★ 优先用 BirdeyeWS 已推送的最新价格（state._lastPriceUsd 由 _onBirdeyePrice 实时更新）
     //   只有 WS 价格超过 PRICE_STALE_MS 没更新，才发 HTTP 兜底请求
     //   这样避免每秒对48个币发HTTP，尤其是低流动性币WS长时间不推送的情况
-    const PRICE_STALE_MS = parseInt(process.env.PRICE_STALE_MS || '30000', 10); // 默认30秒
+    const PRICE_STALE_MS = parseInt(process.env.PRICE_STALE_MS || '60000', 10); // ★ V5: 默认60秒
     let price;
     const wsAge = state._lastPriceUsd ? now - state._lastPriceTs : Infinity;
     if (state._lastPriceUsd && wsAge < PRICE_STALE_MS) {
@@ -775,14 +849,16 @@ class TokenMonitor extends EventEmitter {
   async _createTradeRecord(state) {
     if (!state.position) return;
 
-    // ★ 买入时从 Birdeye 拉取实时 LP 数据（而不是用 webhook 传入的静态值）
+    // ★ V5: 买入时优先用 FDV 缓存中的 LP（_fetchOverview 同时返回 fdv 和 lp）
+    //   getFdvFresh 在 _doBuy 前已经调过了，缓存应该是热的
     let realTimeLp = state.lp;
     try {
-      const lp = await birdeye.getLiquidity(state.address);
+      const cached = birdeye.getCachedFdv(state.address);
+      // getCachedFdv只返回fdv，LP需要从overview缓存中取
+      const lp = await birdeye.getLiquidity(state.address); // 会命中缓存
       if (lp !== null && Number.isFinite(lp)) {
         realTimeLp = lp;
-        state.lp = lp;  // 更新 state 中的 LP
-        logger.info('[Monitor] 📊 %s 实时LP=$%s', state.symbol, Math.round(lp));
+        state.lp = lp;
       }
     } catch (_) {}
 

@@ -218,8 +218,21 @@ process.on('SIGINT',  graceful);
 
 async function graceful() {
   logger.info('[Main] 收到退出信号，清理...');
-  monitor.stop();
+
+  // ★ V5: 先持久化当前状态（保留代币列表和RSI状态）
+  // 如果有持仓，强制卖出但不移除代币
   const tokens = monitor.getTokens();
-  await Promise.allSettled(tokens.map(t => monitor.removeToken(t.address, 'SHUTDOWN')));
+  for (const t of tokens) {
+    if (t.inPosition) {
+      logger.info('[Main] %s 持仓中，执行强制卖出...', t.symbol);
+      try {
+        await monitor.removeToken(t.address, 'SHUTDOWN');
+      } catch (err) {
+        logger.error('[Main] 强制卖出失败 %s: %s', t.symbol, err.message);
+      }
+    }
+  }
+
+  monitor.stop();  // 内部会调用 _persistTokens() 保存剩余代币
   process.exit(0);
 }

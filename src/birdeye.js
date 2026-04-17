@@ -16,8 +16,9 @@ const logger    = require('./logger');
 
 const BIRDEYE_KEY  = process.env.BIRDEYE_API_KEY || '';
 const BASE         = 'https://public-api.birdeye.so';
-// FDV/LP 缓存时间，默认5分钟（可通过 FDV_CACHE_MS 环境变量调整）
-const FDV_CACHE_MS = parseInt(process.env.FDV_CACHE_MS || String(5 * 60 * 1000), 10);
+// FDV/LP 缓存时间，默认30分钟（可通过 FDV_CACHE_MS 环境变量调整）
+// ★ V5: 从5分钟提升到30分钟，FDV变化不敏感，买入前会强制刷新
+const FDV_CACHE_MS = parseInt(process.env.FDV_CACHE_MS || String(30 * 60 * 1000), 10);
 
 // ── WebSocket 价格流 ──────────────────────────────────────────────
 
@@ -225,7 +226,7 @@ async function _fetchOverview(address) {
 // 避免BirdeyeWS推送不活跃的币（低流动性）每秒发HTTP
 
 const _priceHttpCache = new Map(); // address → { price, ts }
-const PRICE_HTTP_CACHE_MS = parseInt(process.env.PRICE_HTTP_CACHE_MS || '30000', 10); // 默认30秒
+const PRICE_HTTP_CACHE_MS = parseInt(process.env.PRICE_HTTP_CACHE_MS || '60000', 10); // ★ V5: 默认60秒
 
 async function getPrice(address) {
   // 1. 优先用 WS 缓存（最新，10秒有效）
