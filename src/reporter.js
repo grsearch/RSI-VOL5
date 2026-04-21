@@ -12,7 +12,7 @@ if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
 function recordsToCsv(records) {
   const headers = [
-    '币种', '合约地址',
+    '币种', '合约地址', 'Age(天)',
     '买入时间', '卖出时间', '持仓时长(分钟)',
     '买入FDV($)', '买入LP($)',
     '买入SOL', '卖出SOL', '盈亏SOL', '盈亏%',
@@ -24,8 +24,10 @@ function recordsToCsv(records) {
     const durMin = (r.buyAt && r.exitAt) ? Math.round((r.exitAt - r.buyAt) / 60000) : '';
     const pnlSol = (r.solOut != null && r.solIn != null)
       ? (r.solOut - r.solIn).toFixed(4) : '';
+    const ageDays = r.createdAt ? ((r.buyAt || Date.now()) - r.createdAt) / 86400000 : '';
+    const ageStr = ageDays !== '' ? (ageDays < 1 ? (ageDays * 24).toFixed(1) + 'h' : ageDays.toFixed(1) + 'd') : '';
     return [
-      r.symbol, r.address,
+      r.symbol, r.address, ageStr,
       fmt(r.buyAt), fmt(r.exitAt), durMin,
       r.entryFdv ?? '', r.entryLp ?? '',
       r.solIn    ?? '', r.solOut  ?? '', pnlSol,

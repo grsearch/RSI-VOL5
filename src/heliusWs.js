@@ -1,55 +1,40 @@
 'use strict';
-// src/heliusWs.js — Helius Enhanced WebSocket 链上交易监听
+// src/heliusWs.js — Helius Enhanced WebSocket 链上交易监听 V5
 //
-// V4 — 自动模式（auto）：根据代币数量动态切换订阅策略
+// 订阅策略（统一支持所有 AMM：Pump/Raydium/Meteora/Orca）：
 //
-// ★ 模式 "auto"（默认）：
-//   - 代币数 ≤ HELIUS_TOKEN_LIMIT（默认15）→ token 精准模式
-//   - 代币数 > HELIUS_TOKEN_LIMIT           → 自动升级到 pump 单订阅
-//   - 升级后添加/移除代币无需重新订阅，无限扩展
+//   代币数 ≤ BATCH_THRESHOLD（默认30）→ 独立订阅（每个 token 一个 subscription）
+//   代币数 > BATCH_THRESHOLD         → 批量订阅（所有 mint 放入一个 accountInclude 数组）
 //
-// ★ 模式 "token"（手动强制）：
-//   每个 token 独立 transactionSubscribe，credits 最省，适合 ≤15 个代币
-//
-// ★ 模式 "pump"（手动强制）：
-//   一个 transactionSubscribe(accountInclude: [PumpAMM])，全量过滤
-//   适合大量代币或频繁增删代币的场景
-//
-// credits 对比（监控 5 个 Pump AMM token）：
-//   "token" 模式：~10 笔/秒 × ~0.5KB ≈ 100 credits/s ≈ 860万/天
-//   "pump"  模式：~80 笔/秒 × ~0.5KB ≈ 800 credits/s ≈ 6900万/天
+//   已彻底移除 pump 模式（只支持 Pump AMM，不适合混合 AMM 场景）。
 
 const WebSocket = require('ws');
 const logger    = require('./logger');
 
-// ── 配置 ────────────────────────────────────────────────────────
+const HELIUS_WSS_URL        = process.env.HELIUS_WSS_URL || '';
+const HELIUS_GATEKEEPER_URL = process.env.HELIUS_GATEKEEPER_URL || '';
+const HELIUS_API_KEY        = process.env.HELIUS_API_KEY || '';
+const HELIUS_RPC_URL        = process.env.HELIUS_RPC_URL || '';
 
-const HELIUS_WSS_URL         = process.env.HELIUS_WSS_URL || '';
-const HELIUS_GATEKEEPER_URL  = process.env.HELIUS_GATEKEEPER_URL || '';
-const HELIUS_API_KEY         = process.env.HELIUS_API_KEY || '';
-const HELIUS_RPC_URL         = process.env.HELIUS_RPC_URL || '';
+// 超过此数量时改用批量订阅
+const BATCH_THRESHOLD = parseInt(process.env.HELIUS_BATCH_THRESHOLD || '30', 10);
 
-// "auto" | "token" | "pump"
-// token = 按 mint 精准订阅，不管代币在哪个 AMM 上交易都能收到（默认，适合混合AMM）
-// auto  = 代币数 ≤ HELIUS_TOKEN_LIMIT 用 token，超过自动切 pump（仅适合纯 Pump.fun 代币）
-// pump  = 强制 Pump AMM 单订阅（只适合全部代币都在 pumpAMM 上交易的场景）
-const CFG_SUB_MODE    = (process.env.HELIUS_SUB_MODE || 'token').toLowerCase();
-// auto 模式下，超过此数量自动切换到 pump 单订阅
-const TOKEN_LIMIT     = parseInt(process.env.HELIUS_TOKEN_LIMIT || '50', 10);
+const LAMPORTS     = 1e9;
+const PING_MS      = 25000;
+const RECONNECT_MS = 2000;
+const MAX_RETRIES  = 999;
 
 function getWsUrl() {
   if (HELIUS_GATEKEEPER_URL) {
     let url = HELIUS_GATEKEEPER_URL;
     if (url.startsWith('https://')) url = url.replace('https://', 'wss://');
-    if (!url.startsWith('wss://')) url = `wss://${url}`;
+    if (!url.startsWith('wss://')) url = 'wss://' + url;
     return { url, type: 'gatekeeper' };
   }
-  if (HELIUS_WSS_URL) {
-    return { url: HELIUS_WSS_URL, type: 'enhanced' };
-  }
+  if (HELIUS_WSS_URL) return { url: HELIUS_WSS_URL, type: 'enhanced' };
   const apiKey = HELIUS_API_KEY || extractApiKey(HELIUS_RPC_URL);
   if (!apiKey) return { url: '', type: 'none' };
-  return { url: `wss://mainnet.helius-rpc.com/?api-key=${apiKey}`, type: 'enhanced' };
+  return { url: 'wss://mainnet.helius-rpc.com/?api-key=' + apiKey, type: 'enhanced' };
 }
 
 function extractApiKey(rpcUrl) {
@@ -57,119 +42,88 @@ function extractApiKey(rpcUrl) {
   return m ? m[1] : '';
 }
 
-const PUMP_AMM_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
-
-const LAMPORTS     = 1e9;
-const PING_MS      = 25000;
-const RECONNECT_MS = 2000;
-const MAX_RETRIES  = 999;
-
-// ── HeliusTradeStream ───────────────────────────────────────────
-
 class HeliusTradeStream {
   constructor() {
     this._ws          = null;
     this._pingTimer   = null;
+    this._statsTimer  = null;
     this._connected   = false;
     this._retryCount  = 0;
     this._connType    = 'none';
-
-    // token → { symbol, onTrade, subId, rpcId }
-    this._tokens = new Map();
-
-    // rpcId → tokenAddress | '__pump__'（用于匹配订阅确认）
-    this._pendingSubs = new Map();
-    this._nextRpcId = 100;
-
-    // pump 模式的 subId
-    this._pumpSubId = null;
-
-    // ★ 实际激活的模式（auto模式下动态变化）
-    // 初始值根据配置决定：手动指定 pump/token 则固定，auto 则从 token 开始
-    this._activeMode = CFG_SUB_MODE === 'pump' ? 'pump' : 'token';
-
-    this._stats = { txReceived: 0, txMatched: 0, txParsed: 0, txSkipped: 0, connType: 'none', subMode: this._activeMode };
+    this._tokens      = new Map(); // address → { symbol, onTrade, subId }
+    this._pendingSubs = new Map(); // rpcId → address | '__batch__'
+    this._nextRpcId   = 100;
+    this._batchSubIds   = [];
+    this._batchSubId    = null;
+    this._batchDebounce    = null;
+    this._batchTimeoutTimer = null;
+    this._CHUNK_SIZE        = 50;
+    this._stats = { txReceived: 0, txMatched: 0, txParsed: 0, txSkipped: 0, connType: 'none' };
   }
-
-  // ── 当前是否使用 pump 模式 ──────────────────────────────────
-  _isPumpMode() { return this._activeMode === 'pump'; }
-
-  // ── 生命周期 ────────────────────────────────────────────────
 
   start() {
     const { url, type } = getWsUrl();
     if (!url) {
-      logger.warn('[HeliusWS] ⚠️ 未配置 Helius WebSocket URL，链上量能数据不可用');
+      logger.warn('[HeliusWS] 未配置 Helius WebSocket URL，链上量能数据不可用');
       return;
     }
     this._connType = type;
     this._stats.connType = type;
-    logger.info('[HeliusWS] 配置模式: %s (当前激活: %s, 代币上限: %d)',
-      CFG_SUB_MODE, this._activeMode, TOKEN_LIMIT);
+    logger.info(`[HeliusWS] 启动 | 批量订阅阈值=${BATCH_THRESHOLD}`);
     this._connect(url);
   }
 
   stop() {
     this._connected = false;
     this._retryCount = MAX_RETRIES + 1;
-    if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
-    if (this._ws) {
-      try { this._ws.close(); } catch (_) {}
-      this._ws = null;
-    }
+    if (this._pingTimer)  { clearInterval(this._pingTimer);  this._pingTimer  = null; }
+    if (this._statsTimer) { clearInterval(this._statsTimer); this._statsTimer = null; }
+    if (this._ws) { try { this._ws.close(); } catch (_) {} this._ws = null; }
   }
-
-  // ── 连接管理 ────────────────────────────────────────────────
 
   _connect(wsUrl) {
     const safeUrl = wsUrl.replace(/api-key=[a-f0-9-]+/i, 'api-key=***');
-    logger.info('[HeliusWS] 连接 %s (类型: %s) ...', safeUrl, this._connType);
+    logger.info('[HeliusWS] 连接 %s ...', safeUrl);
+
+    if (!this._statsTimer) {
+      this._statsTimer = setInterval(() => {
+        const s = this.getStats();
+        logger.info(`[HeliusWS] 状态: tokens=${s.tokens} subMode=${s.subMode} batchSubId=${s.batchSubId||'none'} txReceived=${s.txReceived} txMatched=${s.txMatched} txParsed=${s.txParsed}`);
+      }, 60000);
+    }
 
     this._ws = new WebSocket(wsUrl);
 
     this._ws.on('open', () => {
-      logger.info('[HeliusWS] ✅ %s WebSocket 已连接 (模式: %s)', this._connType.toUpperCase(), this._activeMode);
+      logger.info('[HeliusWS] ✅ 已连接 (%s)', this._connType);
       this._connected  = true;
       this._retryCount = 0;
+      this._batchSubId  = null;
+      this._batchSubIds = [];
 
       this._pingTimer = setInterval(() => {
-        if (this._ws?.readyState === WebSocket.OPEN) this._ws.ping();
+        if (this._ws && this._ws.readyState === WebSocket.OPEN) this._ws.ping();
       }, PING_MS);
 
-      // 重连后恢复订阅（用当前激活的模式）
-      if (this._isPumpMode()) {
-        this._subscribePumpAmm();
-      } else {
-        // ★ 按顺序延迟恢复订阅，每个间隔150ms，避免瞬间大量请求压垮连接
-        let i = 0;
-        for (const [address, info] of this._tokens.entries()) {
-          info.subId = null;
-          const delay = i * 150;
-          setTimeout(() => {
-            if (this._tokens.has(address) && this._connected && !this._isPumpMode()) {
-              this._subscribeToken(address);
-            }
-          }, delay);
-          i++;
-        }
-      }
+      this._resubscribeAll();
     });
 
     this._ws.on('message', (data) => this._handleMessage(data));
     this._ws.on('pong', () => {});
-    this._ws.on('error', (err) => logger.error('[HeliusWS] 错误: %s', err.message));
+    this._ws.on('error', (err) => logger.error(`[HeliusWS] 错误: ${err.message}`));
 
     this._ws.on('close', () => {
       logger.warn('[HeliusWS] 连接关闭');
-      this._connected = false;
+      this._connected  = false;
+      this._batchSubId  = null;
+      this._batchSubIds = [];
       this._pendingSubs.clear();
-      this._pumpSubId = null;
       if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
 
       if (this._retryCount < MAX_RETRIES) {
         this._retryCount++;
         const delay = Math.min(RECONNECT_MS * Math.pow(1.5, this._retryCount - 1), 30000);
-        logger.info('[HeliusWS] %ds 后重连 (第%d次)', (delay / 1000).toFixed(0), this._retryCount);
+        logger.info(`[HeliusWS] ${(delay/1000).toFixed(0)}s 后重连 (第${this._retryCount}次)`);
         setTimeout(() => {
           const { url } = getWsUrl();
           if (url) this._connect(url);
@@ -178,132 +132,73 @@ class HeliusTradeStream {
     });
   }
 
-  // ── 订阅：Pump AMM 模式 ───────────────────────────────────
+  _resubscribeAll() {
+    if (this._tokens.size === 0) return;
+    for (const info of this._tokens.values()) info.subId = null;
 
-  _subscribePumpAmm() {
-    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
-
-    const rpcId = this._nextRpcId++;
-    this._pendingSubs.set(rpcId, '__pump__');
-
-    this._ws.send(JSON.stringify({
-      jsonrpc: '2.0',
-      id: rpcId,
-      method: 'transactionSubscribe',
-      params: [
-        { accountInclude: [PUMP_AMM_PROGRAM], failed: false },
-        {
-          commitment: 'confirmed',
-          encoding: 'jsonParsed',
-          transactionDetails: 'full',
-          maxSupportedTransactionVersion: 0,
-        },
-      ],
-    }));
-    logger.info('[HeliusWS] 📡 订阅 Pump AMM program (单订阅模式)');
+    if (this._tokens.size > BATCH_THRESHOLD) {
+      setTimeout(() => this._subscribeBatch(), 1000);
+    } else {
+      let i = 0;
+      for (const [address] of this._tokens.entries()) {
+        setTimeout(() => {
+          if (this._tokens.has(address) && this._connected) this._subscribeToken(address);
+        }, i * 150);
+        i++;
+      }
+    }
   }
-
-  // ── 订阅：按 Token 精准模式 ───────────────────────────────
 
   _subscribeToken(tokenAddress) {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
-
     const rpcId = this._nextRpcId++;
     this._pendingSubs.set(rpcId, tokenAddress);
-
     this._ws.send(JSON.stringify({
-      jsonrpc: '2.0',
-      id: rpcId,
+      jsonrpc: '2.0', id: rpcId,
       method: 'transactionSubscribe',
       params: [
         { accountInclude: [tokenAddress], failed: false },
-        {
-          commitment: 'confirmed',
-          encoding: 'jsonParsed',
-          transactionDetails: 'full',
-          maxSupportedTransactionVersion: 0,
-        },
+        { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', maxSupportedTransactionVersion: 0 },
       ],
     }));
-
     const info = this._tokens.get(tokenAddress);
-    if (info) info.rpcId = rpcId;
-    logger.info('[HeliusWS] 📡 订阅 token %s (%s)',
-      info?.symbol || '?', tokenAddress.slice(0, 8) + '...');
+    logger.debug(`[HeliusWS] 独立订阅 ${(info && info.symbol) || tokenAddress.slice(0,8)}`);
   }
 
   _unsubscribeToken(tokenAddress) {
     const info = this._tokens.get(tokenAddress);
-    if (!info?.subId) return;
-
-    if (this._ws?.readyState === WebSocket.OPEN) {
-      const rpcId = this._nextRpcId++;
+    if (!info || !info.subId) return;
+    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
       this._ws.send(JSON.stringify({
-        jsonrpc: '2.0',
-        id: rpcId,
+        jsonrpc: '2.0', id: this._nextRpcId++,
         method: 'transactionUnsubscribe',
         params: [info.subId],
       }));
-      logger.info('[HeliusWS] 🔕 取消订阅 %s subId=%s', tokenAddress.slice(0, 8) + '...', info.subId);
     }
     info.subId = null;
   }
 
-  // ── 外部接口 ──────────────────────────────────────────────
+  _subscribeBatch() {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    const addresses = Array.from(this._tokens.keys());
+    if (addresses.length === 0) return;
 
-  subscribe(tokenAddress, symbol, onTrade) {
-    this._tokens.set(tokenAddress, { symbol, onTrade, subId: null, rpcId: null });
-    const count = this._tokens.size;
-
-    // ★ auto 模式：检查是否需要升级到 pump 单订阅
-    if (CFG_SUB_MODE === 'auto' && this._activeMode === 'token' && count > TOKEN_LIMIT) {
-      logger.info('[HeliusWS] 🔄 代币数 %d > 上限 %d，自动切换到 pump 单订阅模式', count, TOKEN_LIMIT);
-      this._upgradeToPump();
-      // 升级后 pump 模式已覆盖所有代币，直接返回
-      logger.info('[HeliusWS] 📌 注册 token %s (%s)，当前监控 %d 个 (模式=pump[auto升级])',
-        symbol, tokenAddress.slice(0, 8) + '...', count);
-      return;
+    // 取消所有旧的批量订阅
+    for (const oldSubId of this._batchSubIds) {
+      this._ws.send(JSON.stringify({
+        jsonrpc: '2.0', id: this._nextRpcId++,
+        method: 'transactionUnsubscribe',
+        params: [oldSubId],
+      }));
     }
+    this._batchSubIds = [];
+    this._batchSubId  = null;
 
-    if (!this._isPumpMode() && this._connected) {
-      // token 模式：发送独立订阅（稍微延迟，避免连发）
-      setTimeout(() => {
-        if (this._tokens.has(tokenAddress) && this._connected && !this._isPumpMode()) {
-          this._subscribeToken(tokenAddress);
-        }
-      }, 50);
-    }
-    // pump 模式：全局订阅已覆盖，无需额外操作
-
-    logger.info('[HeliusWS] 📌 注册 token %s (%s)，当前监控 %d 个 (模式=%s)',
-      symbol, tokenAddress.slice(0, 8) + '...', count, this._activeMode);
-  }
-
-  unsubscribe(tokenAddress) {
-    // token 模式：取消独立订阅（pump模式不需要，全局订阅覆盖）
-    if (!this._isPumpMode()) {
-      this._unsubscribeToken(tokenAddress);
-    }
-    this._tokens.delete(tokenAddress);
-    logger.info('[HeliusWS] 🔕 移除 token %s，剩余 %d 个 (模式=%s)',
-      tokenAddress.slice(0, 8) + '...', this._tokens.size, this._activeMode);
-  }
-
-  // ── auto 模式：token → pump 升级 ──────────────────────────
-  // 取消所有独立订阅，发起一个全局 pump 订阅
-  _upgradeToPump() {
-    if (this._activeMode === 'pump') return;
-    this._activeMode = 'pump';
-    this._stats.subMode = 'pump';
-
-    if (!this._connected || this._ws?.readyState !== WebSocket.OPEN) return;
-
-    // 取消所有已建立的 token 独立订阅
-    for (const [addr, info] of this._tokens.entries()) {
+    // 取消所有独立订阅
+    for (const info of this._tokens.values()) {
       if (info.subId) {
-        const rpcId = this._nextRpcId++;
         this._ws.send(JSON.stringify({
-          jsonrpc: '2.0', id: rpcId,
+          jsonrpc: '2.0', id: this._nextRpcId++,
           method: 'transactionUnsubscribe',
           params: [info.subId],
         }));
@@ -311,181 +206,247 @@ class HeliusTradeStream {
       }
     }
 
-    // 发起 pump AMM 全局订阅
-    this._subscribePumpAmm();
+    // 分块发送批量订阅（每块最多 CHUNK_SIZE 个地址）
+    const chunks = [];
+    for (let i = 0; i < addresses.length; i += this._CHUNK_SIZE) {
+      chunks.push(addresses.slice(i, i + this._CHUNK_SIZE));
+    }
+
+    logger.info(`[HeliusWS] 📡 批量订阅 ${addresses.length} 个 token，分 ${chunks.length} 块`);
+
+    chunks.forEach((chunk, idx) => {
+      const rpcId = this._nextRpcId++;
+      this._pendingSubs.set(rpcId, `__batch_${idx}__`);
+      this._ws.send(JSON.stringify({
+        jsonrpc: '2.0', id: rpcId,
+        method: 'transactionSubscribe',
+        params: [
+          { accountInclude: chunk, failed: false },
+          { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', maxSupportedTransactionVersion: 0 },
+        ],
+      }));
+      logger.info(`[HeliusWS] 📡 块[${idx+1}/${chunks.length}] ${chunk.length} 个 token rpcId=${rpcId}`);
+    });
+
+    // ★ 超时降级：若5秒内未收到任何批量订阅确认，自动回退到独立订阅
+    clearTimeout(this._batchTimeoutTimer);
+    this._batchTimeoutTimer = setTimeout(() => {
+      if (this._batchSubIds.length === 0 && this._connected) {
+        logger.warn('[HeliusWS] ⚠️ 批量订阅5秒内未确认，降级到独立订阅模式');
+        this._fallbackToIndividual();
+      }
+    }, 5000);
   }
 
-  // ── 消息处理 ──────────────────────────────────────────────
+  _fallbackToIndividual() {
+    let i = 0;
+    for (const [addr] of this._tokens.entries()) {
+      setTimeout(() => {
+        if (this._tokens.has(addr) && this._connected) this._subscribeToken(addr);
+      }, i * 100);
+      i++;
+    }
+    logger.info(`[HeliusWS] 🔄 降级独立订阅 ${this._tokens.size} 个 token`);
+  }
+
+  subscribe(tokenAddress, symbol, onTrade) {
+    this._tokens.set(tokenAddress, { symbol, onTrade, subId: null });
+    const count = this._tokens.size;
+
+    if (this._connected) {
+      if (count > BATCH_THRESHOLD) {
+        clearTimeout(this._batchDebounce);
+        this._batchDebounce = setTimeout(() => {
+          if (this._connected) this._subscribeBatch();
+        }, 3000);
+      } else {
+        setTimeout(() => {
+          if (this._tokens.has(tokenAddress) && this._connected) this._subscribeToken(tokenAddress);
+        }, 50);
+      }
+    }
+    logger.info(`[HeliusWS] 📌 注册 ${symbol}，当前监控 ${count} 个`);
+  }
+
+  unsubscribe(tokenAddress) {
+    if (!this._batchSubId) this._unsubscribeToken(tokenAddress);
+    this._tokens.delete(tokenAddress);
+
+    if (this._batchSubId && this._connected) {
+      clearTimeout(this._batchDebounce);
+      this._batchDebounce = setTimeout(() => {
+        if (this._connected) this._subscribeBatch();
+      }, 1000);
+    }
+    logger.info(`[HeliusWS] 🔕 移除 ${tokenAddress.slice(0,8)}，剩余 ${this._tokens.size} 个`);
+  }
 
   _handleMessage(rawData) {
     let msg;
     try { msg = JSON.parse(rawData.toString('utf8')); } catch (_) { return; }
 
-    // 订阅确认
     if (msg.id && msg.result !== undefined) {
       const key = this._pendingSubs.get(msg.id);
-      if (key === '__pump__') {
-        this._pumpSubId = msg.result;
-        this._pendingSubs.delete(msg.id);
-        logger.info('[HeliusWS] ✅ Pump AMM 订阅确认 subId=%s', msg.result);
-      } else if (key) {
-        this._pendingSubs.delete(msg.id);
+      if (!key) return;
+      this._pendingSubs.delete(msg.id);
+
+      if (key.startsWith('__batch_')) {
+        if (typeof msg.result === 'number') {
+          this._batchSubIds.push(msg.result);
+          if (!this._batchSubId) this._batchSubId = msg.result;
+          clearTimeout(this._batchTimeoutTimer); // 收到确认，取消降级计时
+          logger.info(`[HeliusWS] ✅ 批量订阅块确认 subId=${msg.result} (共 ${this._batchSubIds.length} 块)`);
+        } else {
+          logger.warn(`[HeliusWS] ❌ 批量订阅块失败: ${JSON.stringify(msg).slice(0,200)}`);
+          // 降级：逐个独立订阅
+          let i = 0;
+          for (const [addr] of this._tokens.entries()) {
+            setTimeout(() => {
+              if (this._tokens.has(addr) && this._connected) this._subscribeToken(addr);
+            }, i * 100);
+            i++;
+          }
+        }
+      } else {
         const info = this._tokens.get(key);
         if (info) {
           info.subId = msg.result;
-          logger.info('[HeliusWS] ✅ 订阅确认 %s (%s) subId=%s',
-            info.symbol, key.slice(0, 8) + '...', msg.result);
+          logger.debug(`[HeliusWS] ✅ 独立订阅确认 ${key.slice(0,8)} subId=${msg.result}`);
         }
       }
       return;
     }
 
-    // 交易通知
-    if (msg.method === 'transactionNotification' && msg.params?.result) {
+    if (msg.method === 'transactionNotification' && msg.params && msg.params.result) {
       this._stats.txReceived++;
-      this._parseTransaction(msg.params.result, msg.params.subscription);
+      this._parseTransaction(msg.params.result);
     }
   }
 
-  // ── 交易解析 ──────────────────────────────────────────────
-
-  _parseTransaction(result, subscriptionId) {
+  _parseTransaction(result) {
     try {
-      const { transaction: txWrapper, signature } = result;
+      const txWrapper = result.transaction;
       if (!txWrapper) return;
-
-      const meta = txWrapper.meta;
+      const meta   = txWrapper.meta;
       const txData = txWrapper.transaction;
       if (!meta || meta.err) return;
 
       const postTokenBals = meta.postTokenBalances || [];
       if (postTokenBals.length === 0) return;
 
-      if (this._isPumpMode()) {
-        // ── pump 模式：从交易中提取 mint，匹配监控列表 ──
-        const involvedMints = new Set(postTokenBals.map(b => b.mint).filter(Boolean));
-        let matched = false;
+      const involvedMints = new Set(postTokenBals.map(b => b.mint).filter(Boolean));
+      let matched = false;
 
-        for (const mint of involvedMints) {
-          const tokenInfo = this._tokens.get(mint);
-          if (!tokenInfo) continue;
-
-          matched = true;
-          this._stats.txMatched++;
-          const trade = this._extractTrade(mint, meta, txData, signature);
-          if (trade) {
-            this._stats.txParsed++;
-            tokenInfo.onTrade(trade);
-          }
-        }
-
-        if (!matched) this._stats.txSkipped++;
-      } else {
-        // ── token 模式：通过 subscriptionId 精准匹配 ──
-        let targetToken = null;
-        for (const [addr, info] of this._tokens.entries()) {
-          if (info.subId === subscriptionId) {
-            targetToken = { address: addr, ...info };
-            break;
-          }
-        }
-
-        if (targetToken) {
-          this._stats.txMatched++;
-          const trade = this._extractTrade(targetToken.address, meta, txData, signature);
-          if (trade) {
-            this._stats.txParsed++;
-            targetToken.onTrade(trade);
-          }
-          return;
-        }
-
-        // 兜底：subscriptionId 匹配不到时用 mint 匹配
-        const involvedMints = new Set(postTokenBals.map(b => b.mint).filter(Boolean));
-        for (const mint of involvedMints) {
-          const tokenInfo = this._tokens.get(mint);
-          if (!tokenInfo) continue;
-          this._stats.txMatched++;
-          const trade = this._extractTrade(mint, meta, txData, signature);
-          if (trade) {
-            this._stats.txParsed++;
-            tokenInfo.onTrade(trade);
-          }
+      for (const mint of involvedMints) {
+        const tokenInfo = this._tokens.get(mint);
+        if (!tokenInfo) continue;
+        matched = true;
+        this._stats.txMatched++;
+        const trade = this._extractTrade(mint, meta, txData, result.signature);
+        if (trade) {
+          this._stats.txParsed++;
+          tokenInfo.onTrade(trade);
         }
       }
+
+      if (!matched) this._stats.txSkipped++;
     } catch (err) {
-      logger.debug('[HeliusWS] 解析交易失败: %s', err.message);
+      logger.debug(`[HeliusWS] 解析交易失败: ${err.message}`);
     }
   }
 
   _extractTrade(tokenAddress, meta, txData, signature) {
+    const WSOL = 'So11111111111111111111111111111111111111112';
     const preTokenBals  = meta.preTokenBalances  || [];
     const postTokenBals = meta.postTokenBalances  || [];
     const preBalances   = meta.preBalances  || [];
     const postBalances  = meta.postBalances || [];
 
-    let accountKeys = [];
-    if (txData?.message?.accountKeys) {
-      accountKeys = txData.message.accountKeys.map(k =>
-        typeof k === 'string' ? k : k.pubkey
-      );
-    }
-
+    // ── 1. 计算 token 净变化（所有账户合计）──────────────────────
     const postEntries = postTokenBals.filter(b => b.mint === tokenAddress);
     const preEntries  = preTokenBals.filter(b => b.mint === tokenAddress);
     if (postEntries.length === 0) return null;
 
+    // 取最大单笔 token 变化（通常是用户账户，AMM 池子方向相反）
+    let maxBuyDelta = 0, maxSellDelta = 0;
     for (const postEntry of postEntries) {
-      const owner = postEntry.owner;
-      if (!owner) continue;
-
-      const ownerIndex = accountKeys.indexOf(owner);
-      if (ownerIndex < 0 || ownerIndex >= preBalances.length) continue;
-
-      const preEntry = preEntries.find(
-        b => b.accountIndex === postEntry.accountIndex || b.owner === owner
-      );
-
-      const postAmt = parseFloat(postEntry.uiTokenAmount?.uiAmount ?? '0');
-      const preAmt  = preEntry ? parseFloat(preEntry.uiTokenAmount?.uiAmount ?? '0') : 0;
-      const tokenDelta = postAmt - preAmt;
-      if (Math.abs(tokenDelta) < 1e-12) continue;
-
-      const solDelta = (postBalances[ownerIndex] - preBalances[ownerIndex]) / LAMPORTS;
-      const isBuy  = tokenDelta > 0 && solDelta < 0;
-      const isSell = tokenDelta < 0 && solDelta > 0;
-      if (!isBuy && !isSell) continue;
-
-      return {
-        ts: Date.now(),
-        signature,
-        tokenAddress,
-        owner,
-        isBuy,
-        solAmount:   Math.abs(solDelta),
-        tokenAmount: Math.abs(tokenDelta),
-        priceSol:    Math.abs(tokenDelta) > 0 ? Math.abs(solDelta) / Math.abs(tokenDelta) : 0,
-      };
+      const preEntry = preEntries.find(b =>
+        b.accountIndex === postEntry.accountIndex || b.owner === postEntry.owner);
+      const postAmt = parseFloat((postEntry.uiTokenAmount && postEntry.uiTokenAmount.uiAmount) || '0');
+      const preAmt  = preEntry ? parseFloat((preEntry.uiTokenAmount && preEntry.uiTokenAmount.uiAmount) || '0') : 0;
+      const delta = postAmt - preAmt;
+      if (delta > maxBuyDelta)  maxBuyDelta  = delta;
+      if (delta < maxSellDelta) maxSellDelta = delta;
     }
-    return null;
-  }
 
-  // ── 状态查询 ──────────────────────────────────────────────
+    // 净 token 变化：买入时用户账户增加（正），卖出时减少（负）
+    const tokenDelta = Math.abs(maxBuyDelta) >= Math.abs(maxSellDelta) ? maxBuyDelta : maxSellDelta;
+    if (Math.abs(tokenDelta) < 1e-9) return null;
+
+    // ── 2. 计算 SOL 净流入/流出 ───────────────────────────────────
+    // 策略1：原生 SOL 余额变化总和（取非程序账户的变化，排除 AMM 池子账户）
+    let nativeSolDelta = 0;
+    for (let i = 0; i < preBalances.length && i < postBalances.length; i++) {
+      nativeSolDelta += postBalances[i] - preBalances[i];
+    }
+    nativeSolDelta /= LAMPORTS;
+
+    // 策略2：WSOL token 余额净变化（Meteora/Raydium CLMM 等）
+    let wsolNetDelta = 0;
+    const wsolPost = postTokenBals.filter(b => b.mint === WSOL);
+    const wsolPre  = preTokenBals.filter(b => b.mint === WSOL);
+    for (const wp of wsolPost) {
+      const wr = wsolPre.find(b => b.accountIndex === wp.accountIndex || b.owner === wp.owner);
+      const postAmt = parseFloat((wp.uiTokenAmount && wp.uiTokenAmount.uiAmount) || '0');
+      const preAmt  = wr ? parseFloat((wr.uiTokenAmount && wr.uiTokenAmount.uiAmount) || '0') : 0;
+      wsolNetDelta += postAmt - preAmt;
+    }
+
+    // ── 3. 判断买卖方向 ───────────────────────────────────────────
+    // token 增加 = 买入（用 SOL 买了 token）
+    // token 减少 = 卖出（卖了 token 换 SOL）
+    const isBuy  = tokenDelta > 0;
+    const isSell = tokenDelta < 0;
+
+    // 计算 SOL 金额（取绝对值最大的那个来源）
+    // 买入：SOL 流出（负值），卖出：SOL 流入（正值）
+    let solAmount = 0;
+    if (Math.abs(wsolNetDelta) > Math.abs(nativeSolDelta) * 0.5 + 1e-6) {
+      // WSOL 变化更显著（Meteora 等）
+      solAmount = Math.abs(wsolNetDelta);
+    } else if (Math.abs(nativeSolDelta) > 1e-6) {
+      // 原生 SOL 变化（Pump AMM 等）
+      solAmount = Math.abs(nativeSolDelta);
+    } else {
+      // 两者都很小，仍记录交易但 SOL 金额为 0（不影响方向判断）
+      solAmount = 0;
+    }
+
+    const absTokenDelta = Math.abs(tokenDelta);
+    return {
+      ts: Date.now(), signature, tokenAddress,
+      owner: postEntries[0]?.owner || '',
+      isBuy,
+      solAmount,
+      tokenAmount: absTokenDelta,
+      priceSol: absTokenDelta > 0 ? solAmount / absTokenDelta : 0,
+    };
+  }
 
   isConnected() { return this._connected; }
   getSubscriptionCount() { return this._tokens.size; }
 
   getStats() {
     let confirmedSubs = 0;
-    for (const info of this._tokens.values()) {
-      if (info.subId) confirmedSubs++;
-    }
+    for (const info of this._tokens.values()) { if (info.subId) confirmedSubs++; }
     return {
       connected:     this._connected,
       connType:      this._connType,
-      subMode:       this._activeMode,
+      subMode:       this._batchSubId ? 'batch' : 'token',
       tokens:        this._tokens.size,
-      confirmedSubs: this._isPumpMode() ? (this._pumpSubId ? 1 : 0) : confirmedSubs,
+      confirmedSubs: this._batchSubId ? this._tokens.size : confirmedSubs,
+      batchSubId:    this._batchSubId || null,
+      batchActive:   this._batchSubIds.length > 0,
       retryCount:    this._retryCount,
       ...this._stats,
     };

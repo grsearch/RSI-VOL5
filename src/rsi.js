@@ -23,7 +23,7 @@ const KLINE_SEC    = parseInt(process.env.KLINE_INTERVAL_SEC || '300', 10);
 const VOL_ENABLED         = (process.env.VOL_ENABLED || 'true') === 'true';
 const VOL_BUY_MULT        = parseFloat(process.env.VOL_BUY_MULT          || '1.2');
 const VOL_SELL_MULT       = parseFloat(process.env.VOL_SELL_MULT         || '999'); // sellVol >= N × buyVol 触发卖出（默认999=禁用）
-const VOL_MIN_TOTAL       = parseFloat(process.env.VOL_MIN_TOTAL         || '15');  // 最低总成交量(SOL) // buyVol >= N × sellVol 才买入
+const VOL_MIN_TOTAL       = parseFloat(process.env.VOL_MIN_TOTAL         || '5');   // 最低总成交量(SOL)，买入窗口内 buyVol+sellVol >= N SOL
 const VOL_WINDOW_SEC      = parseInt(process.env.VOL_WINDOW_SEC       || '300', 10);
 const VOL_EXIT_CONSECUTIVE = parseInt(process.env.VOL_EXIT_CONSECUTIVE || '2', 10);
 const VOL_EXIT_RATIO      = parseFloat(process.env.VOL_EXIT_RATIO     || '1.0');
@@ -38,6 +38,19 @@ const STOP_LOSS_PCT   = parseFloat(process.env.STOP_LOSS_PCT   || '-20');
 const TRAILING_STOP_ENABLED  = (process.env.TRAILING_STOP_ENABLED  || 'true') === 'true';
 const TRAILING_STOP_ACTIVATE = parseFloat(process.env.TRAILING_STOP_ACTIVATE || '30'); // 上涨 30% 后激活
 const TRAILING_STOP_PCT      = parseFloat(process.env.TRAILING_STOP_PCT      || '-20'); // 峰值回撤 20% 清仓
+
+// EMA99 买入过滤：价格必须在 EMA99 下方才允许买入
+const EMA_PERIOD = parseInt(process.env.EMA_PERIOD || '99', 10);
+
+function calcEMA(closes, period) {
+  if (closes.length < period) return NaN;
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
 
 // ── Wilder RSI 计算 ────────────────────────────────────────────────
 
@@ -91,14 +104,9 @@ function checkBuyVolume(closedCandles, currentCandle) {
     return { pass: false, reason: 'VOL_INSUFFICIENT_DATA', buyVol: 0, sellVol: 0, ratio: 0 };
   }
 
-  const windowCandles = allCandles.slice(-windowBars);
-
-  let totalBuy  = 0;
-  let totalSell = 0;
-  for (const c of windowCandles) {
-    totalBuy  += (c.buyVolume  || 0);
-    totalSell += (c.sellVolume || 0);
-  }
+  // ★ 用 calcVolumeInfo 计算量能（自动扩展窗口，跳过历史K线）
+  const _volInfo = calcVolumeInfo(allCandles, windowBars, KLINE_SEC);
+  let totalBuy = _volInfo.buyVol, totalSell = _volInfo.sellVol;
 
   const total = totalBuy + totalSell;
   const ratio = total > 0 ? totalBuy / total : 0;
@@ -211,7 +219,7 @@ function checkStopLoss(currentPrice, tokenState) {
 
 // ── 主信号函数 ─────────────────────────────────────────────────────
 
-function evaluateSignal(closedCandles, realtimePrice, tokenState) {
+function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
   const MIN_CANDLES = RSI_PERIOD + 2;
   if (!closedCandles || closedCandles.length < MIN_CANDLES) {
     return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'warming_up', volume: {} };
@@ -259,37 +267,26 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
     tokenState._prevRsiTs       = nowMs;
   };
 
-  // 量能信息
-  const latestCandle = closedCandles[len - 1];
+  // 量能信息：从原始K线（rawCandles）单独计算，不依赖 RSI 用的 closedCandles
+  // 这样量能数据（含无价格的链上K线）和 RSI（仅有价格的K线）完全分离
   const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
-  const windowCandles = closedCandles.slice(-windowBars);
-  let winBuy = 0, winSell = 0;
-  for (const c of windowCandles) {
-    winBuy  += (c.buyVolume  || 0);
-    winSell += (c.sellVolume || 0);
-  }
-  const winTotal = winBuy + winSell;
-  const volumeInfo = {
-    currentVol: latestCandle.volume || 0,
-    buyVol:  winBuy,
-    sellVol: winSell,
-    buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
-    windowSec: VOL_WINDOW_SEC,
-  };
+  const _rawForVol = rawCandles || closedCandles; // 兼容未传 rawCandles 的情况
+  const volumeInfo = calcVolumeInfo(_rawForVol, windowBars, KLINE_SEC);
 
   // ── SELL 优先（持仓中） ────────────────────────────────────────
   if (tokenState.inPosition) {
 
     // 1. RSI > 80 恐慌卖
-    //    ★ 不受 lastSellCandle 限制（修复：K线防抖会导致同K线内卖出失败后无法重试）
-    //    ★ 改用 2 秒时间防抖，避免每个 tick 都重复触发日志，但保证卖出失败后能重试
-    if (rsiRealtime > RSI_PANIC) {
+    //    ★ V5: 只信任已收盘K线RSI（lastClosedRsi），不用 stepRSI 实时估算
+    //    stepRSI 在K线内波动剧烈时容易算出虚假高值（如95.7），
+    //    导致在RSI实际只有40-60的时候误触恐慌卖出
+    if (lastClosedRsi > RSI_PANIC) {
       const lastPanicTs = tokenState._lastPanicSellTs ?? 0;
       if (nowMs - lastPanicTs >= 2000) {
         tokenState._lastPanicSellTs = nowMs;
         updateState();
-        return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
-                 reason: `RSI_PANIC(${rsiRealtime.toFixed(1)}>${RSI_PANIC})`, volume: volumeInfo };
+        return { rsi: lastClosedRsi, prevRsi, signal: 'SELL',
+                 reason: `RSI_PANIC(${lastClosedRsi.toFixed(1)}>${RSI_PANIC})`, volume: volumeInfo };
       }
     }
 
@@ -309,10 +306,8 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
                reason: sl.reason, volume: volumeInfo };
     }
 
-    // 4. 卖压超过买压 — ★ V5: 已禁用（VOL_SELL_MULT 设999也仍会判断，彻底跳过）
-    // if (VOL_ENABLED && winTotal > 0 && winSell >= winBuy * VOL_SELL_MULT && lastCandleTs !== lastSellCandle) {
-    //   ...
-    // }
+    // 4. 卖压卖出 — 已彻底禁用
+    // if (VOL_ENABLED && winTotal > 0 && winSell >= winBuy * VOL_SELL_MULT ...) { ... }
 
     // 5. 量能萎缩出场
     const volDecay = checkVolumeDecay(closedCandles, tokenState);
@@ -327,16 +322,26 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
   // ★ RSI < 30（超卖区）+ buyVol >= 1.2 × sellVol
   if (!tokenState.inPosition) {
     if (rsiRealtime < RSI_BUY && lastCandleTs !== lastBuyCandle) {
-      const volCheck = checkBuyVolume(closedCandles, null);
+      // ★ EMA99 过滤：价格必须在 EMA99 下方才允许买入
+      const ema99 = calcEMA(closes, EMA_PERIOD);
+      if (Number.isFinite(ema99) && realtimePrice >= ema99) {
+        updateState();
+        return { rsi: rsiRealtime, prevRsi, signal: null,
+                 reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
+      }
+
+      const volCheck = checkBuyVolume(_rawForVol, null); // 用原始K线（含量能）做量能判断
       volumeInfo.buyVol   = volCheck.buyVol;
       volumeInfo.sellVol  = volCheck.sellVol;
       volumeInfo.buyRatio = volCheck.ratio;
 
       if (volCheck.pass) {
-        tokenState._lastBuyCandle = lastCandleTs;
+        // ★ 注意：不在此处标记 _lastBuyCandle，由 monitor._canBuy 通过冷却检查后再标记
+        // 这样冷却期内不会白白消耗K线槽位，冷却结束后第一根满足条件的K线即可买入
         updateState();
         return { rsi: rsiRealtime, prevRsi, signal: 'BUY',
-                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+${volCheck.reason}`, volume: volumeInfo };
+                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+EMA99OK+${volCheck.reason}`,
+                 volume: volumeInfo, candleTs: lastCandleTs };
       }
       // 量能不达标，不标记 lastBuyCandle，下根K线继续检查
     }
@@ -447,17 +452,68 @@ function buildCandles(ticks, intervalSec = KLINE_SEC) {
 }
 
 /**
- * 过滤掉 open 为 null 的 K 线（只有链上 tick，没有价格数据的 K 线）
- * RSI 计算前调用
+ * 过滤K线用于 RSI/EMA 计算：只保留有真实价格数据的K线
+ * 量能统计由 calcVolumeInfo() 单独从原始 rawCandles 里取，两者完全分离
  */
 function filterValidCandles(candles) {
   return candles.filter(c => c.open !== null && c.close !== null);
+}
+
+/**
+ * 从原始K线（含无价格的量能K线）计算量能信息
+ * 不依赖 filterValidCandles，直接扫描所有K线的 buyVolume/sellVolume
+ * @param {Array} rawCandles - buildCandles 返回的未过滤K线
+ * @param {number} windowBars - 统计窗口（根数）
+ * @param {number} klineSec - K线宽度（秒）
+ */
+function calcVolumeInfo(rawCandles, windowBars, klineSec) {
+  // ★ 先过滤出实时K线（非历史）
+  const liveCandles = rawCandles.filter(c => !c.fromHistory);
+
+  // 用标准窗口（VOL_WINDOW_SEC 对应的K线根数）
+  // 若标准窗口内无数据，最多往前扩展到8根，但只取最近有数据的那一根
+  // 目的是：K线收盘瞬间不显示空白，用上一根K线的量能过渡
+  const stdLookback = Math.min(liveCandles.length, windowBars);
+  let wc = liveCandles.slice(-stdLookback);
+
+  let winBuy = 0, winSell = 0;
+  for (const c of wc) {
+    winBuy  += (c.buyVolume  || 0);
+    winSell += (c.sellVolume || 0);
+  }
+
+  // 若标准窗口内无数据，往前最多找8根，取最近一根有量能的K线
+  if (winBuy + winSell === 0 && liveCandles.length > stdLookback) {
+    const extLookback = Math.min(liveCandles.length, 8);
+    const extCandles = liveCandles.slice(-extLookback);
+    for (let i = extCandles.length - 1; i >= 0; i--) {
+      const c = extCandles[i];
+      if ((c.buyVolume || 0) + (c.sellVolume || 0) > 0) {
+        winBuy  = c.buyVolume  || 0;
+        winSell = c.sellVolume || 0;
+        wc = [c];
+        break;
+      }
+    }
+  }
+
+  const winTotal = winBuy + winSell;
+  const currentVol = wc.length > 0 ? wc[wc.length - 1].volume || 0 : 0;
+
+  return {
+    currentVol,
+    buyVol:   winBuy,
+    sellVol:  winSell,
+    buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
+    windowSec: stdLookback * klineSec,
+  };
 }
 
 module.exports = {
   evaluateSignal,
   buildCandles,
   filterValidCandles,
+  calcVolumeInfo,
   calcRSIWithState,
   stepRSI,
   checkBuyVolume,
@@ -470,5 +526,6 @@ module.exports = {
     SKIP_FIRST_CANDLES,
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, KLINE_SEC,
     TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT,
+    EMA_PERIOD,
   },
 };

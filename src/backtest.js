@@ -52,7 +52,8 @@ function runBacktest(ticks, params) {
     volBuyMult     = 1.2,
     volSellMult    = 1.2,
     volMinTotal    = 5,
-    sellCooldownSec = 30,
+    sellCooldownSec = 1800,  // 默认30分钟冷却期
+    emaPeriod      = 99,    // EMA99 买入过滤
   } = params;
 
   if (!ticks || ticks.length === 0) return null;
@@ -64,6 +65,17 @@ function runBacktest(ticks, params) {
     const nag = (ag * (period-1) + (d>0?d:0)) / period;
     const nal = (al * (period-1) + (d<0?Math.abs(d):0)) / period;
     return nal === 0 ? 100 : 100 - 100 / (1 + nag / nal);
+  }
+
+  // ── EMA 计算 ─────────────────────────────────────────────────
+  function calcEMA(closes, period) {
+    if (closes.length < period) return NaN;
+    const k = 2 / (period + 1);
+    let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    for (let i = period; i < closes.length; i++) {
+      ema = closes[i] * k + ema * (1 - k);
+    }
+    return ema;
   }
 
   // ── 构建 K 线（区分 price / chain tick） ───────────────────
@@ -181,10 +193,10 @@ function runBacktest(ticks, params) {
 
       let exitReason = null;
 
-      // RSI > panic
-      if (rsiRT > rsiPanic && candleOT !== lastSellCandle) {
+      // RSI > panic — ★ 用已收盘K线RSI，不用stepRSI（与live一致）
+      if (rsiArray[ci] > rsiPanic && candleOT !== lastSellCandle) {
         lastSellCandle = candleOT;
-        exitReason = `RSI_PANIC(${rsiRT.toFixed(1)})`;
+        exitReason = `RSI_PANIC(${rsiArray[ci].toFixed(1)})`;
       }
       // RSI 下穿 sell
       if (!exitReason && prevRsi >= rsiSell && rsiRT < rsiSell && candleOT !== lastSellCandle) {
@@ -205,18 +217,9 @@ function runBacktest(ticks, params) {
         if (pnl >= takeProfitPct) exitReason = `TAKE_PROFIT(${pnl.toFixed(1)}%)`;
         else if (pnl <= stopLossPct) exitReason = `STOP_LOSS(${pnl.toFixed(1)}%)`;
       }
-      // 卖压超过买压：sellVol >= volSellMult × buyVol
-      if (!exitReason && volEnabled && candleOT !== lastSellCandle) {
-        const start = Math.max(0, ci - windowBars + 1);
-        const wc = candles.slice(start, ci + 1);
-        let wb = 0, ws = 0;
-        for (const c of wc) { wb += (c.buyVolume||0); ws += (c.sellVolume||0); }
-        if ((wb + ws) > 0 && ws >= wb * volSellMult) {
-          lastSellCandle = candleOT;
-          const m = wb > 0 ? (ws/wb).toFixed(1) : '∞';
-          exitReason = `SELL_PRESSURE(${m}x,${ws.toFixed(1)}/${wb.toFixed(1)})`;
-        }
-      }
+      // 卖压 — 已禁用
+      // if (!exitReason && volEnabled && candleOT !== lastSellCandle) { ... }
+
       // 量能萎缩
       if (!exitReason && volEnabled && ci >= volExitLookback + volExitConsecutive) {
         const ae = ci - volExitConsecutive + 1;
@@ -233,9 +236,12 @@ function runBacktest(ticks, params) {
 
       if (exitReason) {
         const solOut = tradeSizeSol * (price / entryPrice);
+        // 计算持仓K线数
+        const entryCI = closedIdx(entryTime);
+        const holdBars = entryCI >= 0 ? ci - entryCI : Math.round((ts - entryTime) / (klineSec * 1000));
         trades.push({
           entryPrice, exitPrice: price, entryTime, exitTime: ts,
-          holdMs: ts - entryTime,
+          holdMs: ts - entryTime, holdBars,
           solIn: tradeSizeSol, solOut,
           pnlSol: solOut - tradeSizeSol,
           pnlPct: (price - entryPrice) / entryPrice * 100,
@@ -253,6 +259,12 @@ function runBacktest(ticks, params) {
     // ── BUY ──────────────────────────────────────────────
     if (!inPosition && trades.length < maxTrades) {
       if (rsiRT < rsiBuy && ts >= cooldownUntil && candleOT !== lastBuyCandle) {
+        // ★ EMA99 过滤：价格必须在 EMA99 下方
+        const ema99 = calcEMA(closes, emaPeriod);
+        if (Number.isFinite(ema99) && price >= ema99) {
+          prevRsiRT = rsiRT;
+          continue;
+        }
         if (volEnabled) {
           // 检查量能
           const start = Math.max(0, ci - windowBars + 1);
@@ -279,9 +291,12 @@ function runBacktest(ticks, params) {
   if (inPosition && priceTicks.length > 0) {
     const last = priceTicks[priceTicks.length - 1];
     const solOut = tradeSizeSol * (last.price / entryPrice);
+    const entryCI = closedIdx(entryTime);
+    const lastCI  = closedIdx(last.ts);
+    const holdBars = (entryCI >= 0 && lastCI >= 0) ? lastCI - entryCI : Math.round((last.ts - entryTime) / (klineSec * 1000));
     trades.push({
       entryPrice, exitPrice: last.price, entryTime, exitTime: last.ts,
-      holdMs: last.ts - entryTime,
+      holdMs: last.ts - entryTime, holdBars,
       solIn: tradeSizeSol, solOut,
       pnlSol: solOut - tradeSizeSol,
       pnlPct: (last.price - entryPrice) / entryPrice * 100,
@@ -401,8 +416,8 @@ function gridSearchFromTicks(allTicks) {
       klineSec: 60, volEnabled: true,
       volSellMult: 8888, volMinTotal: 5, volWindowSec: 120,
       volExitConsecutive: 3, volExitRatio: 0.3, volExitLookback: 4,
-      tradeSizeSol: 0.2, maxTrades: 99999, sellCooldownSec: 30,
-      takeProfitPct: 99999,
+      tradeSizeSol: 0.2, maxTrades: 99999, sellCooldownSec: 1800, // 30分钟冷却
+      takeProfitPct: 99999, emaPeriod: 99, // ★ EMA99 过滤启用
       ...combo,
     };
 

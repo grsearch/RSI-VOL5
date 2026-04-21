@@ -84,8 +84,8 @@ function flushTicks() {
         }
       }
       existing.push(...newTicks);
-      // ★ V5: 裁剪超过2小时的旧数据（避免47币的JSON文件无限增长）
-      const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+      // ★ V5: 裁剪超过24小时的旧数据（回测需要足够的历史数据）
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
       if (existing.length > 0 && existing[0].ts < cutoff) {
         const idx = existing.findIndex(t => t.ts >= cutoff);
         if (idx > 0) existing = existing.slice(idx);

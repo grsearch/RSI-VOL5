@@ -57,7 +57,37 @@ const { runBacktest: btRun, gridSearchFromTicks } = require('./backtest');
 
 app.post('/api/backtest/run', (req, res) => {
   try {
-    const params = req.body || {};
+    const raw = req.body || {};
+    // 显式映射前端字段名 → runBacktest 参数名，确保所有参数正确传入
+    const params = {
+      klineSec:             parseInt(raw.klineSec        || 300),
+      rsiPeriod:            parseInt(raw.rsiPeriod       || 9),
+      rsiBuy:               parseFloat(raw.rsiBuy        || 35),
+      rsiSell:              parseFloat(raw.rsiSell       || 70),
+      rsiPanic:             parseFloat(raw.rsiPanic      || 80),
+      volEnabled:           raw.volEnabled !== false,
+      volBuyMult:           parseFloat(raw.volBuyMult    || 1.2),
+      volSellMult:          parseFloat(raw.volSellMult   || 9999),
+      volMinTotal:          parseFloat(raw.volMinTotal   || 5),
+      volWindowSec:         parseInt(raw.volWindowSec    || 300),
+      volExitConsecutive:   parseInt(raw.volExitConsecutive || 3),
+      volExitRatio:         parseFloat(raw.volExitRatio  || 0.3),
+      volExitLookback:      parseInt(raw.volExitLookback || 4),
+      skipFirstCandles:     parseInt(raw.skipFirstCandles || 8),
+      takeProfitPct:        parseFloat(raw.takeProfitPct || 99999),
+      stopLossPct:          parseFloat(raw.stopLossPct   || -20),
+      trailingStopEnabled:  raw.trailingStopEnabled !== false,
+      trailingStopActivate: parseFloat(raw.trailingStopActivate || 30),
+      trailingStopPct:      parseFloat(raw.trailingStopPct      || -20),
+      tradeSizeSol:         parseFloat(raw.tradeSizeSol  || 0.2),
+      maxTrades:            parseInt(raw.maxTrades       || 99999),
+      sellCooldownSec:      parseInt(raw.sellCooldownSec || 1800),
+      emaPeriod:            parseInt(raw.emaPeriod       || 99),
+      emaEnabled:           raw.emaEnabled !== false,
+    };
+    // 若前端关闭EMA，将 emaPeriod 设为极大值使其永远不满足条件
+    if (!params.emaEnabled) params.emaPeriod = 999999;
+
     const files = dataStore.listTickFiles();
     if (files.length === 0) {
       return res.json({ error: '无 tick 数据', results: [], summary: null });
